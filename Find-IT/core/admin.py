@@ -19,13 +19,19 @@ class ProfileInline(admin.StackedInline):
     model = Profile
     can_delete = False
     extra = 0
-    fields = ("role", "student_id")
+    fields = ("role", "student_id", "contact_number", "photo")
 
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     inlines = [ProfileInline]
-    list_display = ("username", "first_name", "is_active", "is_staff", "is_superuser")
+    list_display = ("username", "first_name", "last_name", "email", "account_role", "is_active", "is_staff", "is_superuser")
+    list_filter = ("profile__role", "is_active", "is_staff", "is_superuser")
+
+    @admin.display(description="Find-IT role")
+    def account_role(self, obj):
+        profile = getattr(obj, "profile", None)
+        return profile.get_role_display() if profile else "—"
 
 
 class VerificationQuestionInline(admin.TabularInline):

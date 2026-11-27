@@ -4,7 +4,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
-from .validators import validate_photo
+from .validators import validate_photo, validate_profile_photo
 
 
 class Profile(models.Model):
@@ -16,6 +16,10 @@ class Profile(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField(max_length=16, choices=Role.choices, default=Role.STUDENT)
     student_id = models.CharField(max_length=9, unique=True, null=True, blank=True)
+    contact_number = models.CharField(max_length=20, blank=True)
+    photo = models.ImageField(
+        upload_to="profile-photos/%Y/%m/", validators=[validate_profile_photo], blank=True, null=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

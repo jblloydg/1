@@ -1,5 +1,5 @@
 from django.contrib import messages
-from django.contrib.auth import authenticate, get_user_model, login, logout
+from django.contrib.auth import authenticate, get_user_model, login, logout, update_session_auth_hash
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm
 from django.db import IntegrityError, transaction
@@ -13,7 +13,7 @@ from django.views.decorators.http import require_POST
 
 from .forms import (
     AdminReviewForm, ClaimAnswerForm, CloseReasonForm, CommentForm,
-    FindItLoginForm, ItemPostForm, ReportForm, SignupForm, StaffAccountForm,
+    FindItLoginForm, FindItPasswordChangeForm, ItemPostForm, ProfileForm, ReportForm, SignupForm, StaffAccountForm,
     SystemSettingsForm,
 )
 from .models import (
@@ -44,26 +44,77 @@ def landing(request):
     return render(request, "core/landing.html", {"login_form": FindItLoginForm()})
 
 
+def _role_home(user):
+    """Default landing page after sign-in when no safe ?next= page was requested."""
+    return "staff-dashboard" if is_staff_or_admin(user) else "home"
+
+
 def login_view(request):
     if request.user.is_authenticated:
-        return redirect(_safe_next(request))
+        return redirect(_safe_next(request, fallback=_role_home(request.user)))
     form = FindItLoginForm(request, data=request.POST or None)
-    if request.method == "POST" and form.is_valid():
-        login(request, form.get_user())
-        return redirect(_safe_next(request))
-    return render(request, "core/login.html", {"form": form, "next": request.GET.get("next", "")})
+    if request.method == "POST":
+        if form.is_valid():
+            user = form.get_user()
+            login(request, user)  # Rotates the session key to prevent session fixation.
+            messages.success(request, f"Welcome back, {user.first_name or user.username}.")
+            return redirect(_safe_next(request, fallback=_role_home(user)))
+        messages.error(request, "Sign-in failed. Check the details below.")
+    return render(request, "core/login.html", {
+        "form": form,
+        "next": request.POST.get("next") or request.GET.get("next", ""),
+    })
 
 
 def signup_view(request):
     if request.user.is_authenticated:
         return redirect("home")
-    form = SignupForm(request.POST or None)
-    if request.method == "POST" and form.is_valid():
-        user = form.save()
-        login(request, user, backend="django.contrib.auth.backends.ModelBackend")
-        messages.success(request, "Your demo account is ready.")
-        return redirect(_safe_next(request))
+    form = SignupForm(request.POST if request.method == "POST" else None)
+    if request.method == "POST":
+        if form.is_valid():
+            user = form.save()
+            login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+            messages.success(request, "Your student account was created and you are now signed in.")
+            return redirect(_safe_next(request))
+        messages.error(request, "Your account was not created. Fix the highlighted fields and try again.")
     return render(request, "core/signup.html", {"form": form})
+
+
+@login_required
+def my_profile(request):
+    user = User.objects.select_related("profile").get(pk=request.user.pk)
+    return render(request, "core/profile.html", {"profile_user": user, "profile": user.profile})
+
+
+@login_required
+def edit_profile(request):
+    # Always the signed-in user's own record: there is no user id in the URL to tamper with.
+    user = User.objects.select_related("profile").get(pk=request.user.pk)
+    form = ProfileForm(
+        request.POST if request.method == "POST" else None,
+        request.FILES if request.method == "POST" else None,
+        user=user,
+    )
+    if request.method == "POST":
+        if form.is_valid():
+            form.save()
+            messages.success(request, "Your profile was updated.")
+            return redirect("my-profile")
+        messages.error(request, "Your profile was not saved. Fix the highlighted fields and try again.")
+    return render(request, "core/profile_edit.html", {"form": form, "profile": user.profile})
+
+
+@login_required
+def change_password(request):
+    form = FindItPasswordChangeForm(request.user, request.POST if request.method == "POST" else None)
+    if request.method == "POST":
+        if form.is_valid():
+            user = form.save()
+            update_session_auth_hash(request, user)  # Keep this session; other sessions are signed out.
+            messages.success(request, "Your password was changed.")
+            return redirect("my-profile")
+        messages.error(request, "Your password was not changed. Fix the highlighted fields and try again.")
+    return render(request, "core/change_password.html", {"form": form})
 
 
 @require_POST
@@ -537,14 +588,53 @@ def staff_dashboard(request):
 def staff_accounts(request):
     if not is_admin(request.user):
         return HttpResponseForbidden("Administrator access is required.")
-    form = StaffAccountForm(request.POST or None)
-    if request.method == "POST" and form.is_valid():
-        user = form.save()
-        audit(request.user, "created_staff_account", user, "Staff account created by administrator.")
-        messages.success(request, f"Staff account for {user.get_full_name()} was created.")
+    form = StaffAccountForm(request.POST if request.method == "POST" else None)
+    if request.method == "POST":
+        if form.is_valid():
+            user = form.save()
+            audit(request.user, "created_staff_account", user, "Staff account created by administrator.")
+            messages.success(request, f"Staff account for {user.get_full_name() or user.username} was created.")
+            return redirect("staff-accounts")
+        messages.error(request, "The staff account was not created. Fix the highlighted fields and try again.")
+    staff_users = User.objects.filter(profile__role=Profile.Role.STAFF).order_by("first_name", "username")
+    role_filter = request.GET.get("role", "").strip()
+    accounts = User.objects.select_related("profile").order_by("profile__role", "first_name", "username")
+    if role_filter in dict(Profile.Role.choices):
+        accounts = accounts.filter(profile__role=role_filter)
+    else:
+        role_filter = ""
+    return render(request, "core/staff_accounts.html", {
+        "form": form,
+        "staff_users": staff_users,
+        "accounts": accounts[:300],
+        "role_filter": role_filter,
+        "role_choices": Profile.Role.choices,
+    })
+
+
+@login_required
+@require_POST
+def staff_account_status(request, user_id):
+    """Administrators activate or suspend Staff accounts only. Roles are never changed here."""
+    if not is_admin(request.user):
+        return HttpResponseForbidden("Administrator access is required.")
+    target = get_object_or_404(User.objects.select_related("profile"), pk=user_id)
+    if target.pk == request.user.pk or target.is_superuser or role_of(target) != Profile.Role.STAFF:
+        return HttpResponseForbidden("Only staff accounts can be activated or suspended here.")
+    action = request.POST.get("action")
+    if action == "suspend":
+        target.is_active = False
+        message = f"{target.get_full_name() or target.username} was suspended and can no longer sign in."
+    elif action == "activate":
+        target.is_active = True
+        message = f"{target.get_full_name() or target.username} was activated."
+    else:
+        messages.error(request, "Choose activate or suspend.")
         return redirect("staff-accounts")
-    staff_users = User.objects.filter(profile__role=Profile.Role.STAFF).order_by("first_name")
-    return render(request, "core/staff_accounts.html", {"form": form, "staff_users": staff_users})
+    target.save(update_fields=["is_active"])
+    audit(request.user, f"{action}_staff_account", target, f"Staff account {action}d by administrator.")
+    messages.success(request, message)
+    return redirect("staff-accounts")
 
 
 @login_required

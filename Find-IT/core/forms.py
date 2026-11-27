@@ -2,76 +2,151 @@ import re
 
 from django import forms
 from django.contrib.auth import authenticate, get_user_model
-from django.contrib.auth.forms import AuthenticationForm, SetPasswordForm
+from django.contrib.auth.forms import AuthenticationForm, PasswordChangeForm, SetPasswordForm
+from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.db import transaction
 
 from .models import ItemPost, SystemSettings, AbuseReport, Profile
-from .validators import validate_photo
+from .validators import validate_photo, validate_profile_photo
 
 User = get_user_model()
 STUDENT_ID_PATTERN = re.compile(r"^\d{4}-\d{4}$")
 
 
+PHONE_PATTERN = re.compile(r"^\+?[0-9][0-9 -]{5,18}[0-9]$")
+
+
+def email_in_use(email, exclude_user=None):
+    """Email addresses are unique across all accounts, ignoring letter case."""
+    users = User.objects.filter(email__iexact=email)
+    if exclude_user is not None:
+        users = users.exclude(pk=exclude_user.pk)
+    return users.exists()
+
+
+def _check_password_strength(form, field, password, candidate):
+    try:
+        validate_password(password, candidate)
+    except ValidationError as exc:
+        form.add_error(field, exc)
+
+
 class FindItLoginForm(AuthenticationForm):
+    """Students sign in with their Student ID; staff and administrators use their assigned username."""
+
+    error_messages = {
+        **AuthenticationForm.error_messages,
+        "invalid_login": (
+            "Incorrect Student ID / username or password. Passwords are case-sensitive. "
+            "If your account was suspended, contact a Find-IT administrator."
+        ),
+    }
+
     username = forms.CharField(
-        label="School ID or staff username",
-        widget=forms.TextInput(attrs={"autocomplete": "username", "placeholder": "2024-0122"}),
+        label="Student ID or staff username",
+        widget=forms.TextInput(attrs={"autocomplete": "username", "placeholder": "2024-0122", "autofocus": True}),
     )
     password = forms.CharField(
         label="Password",
         strip=False,
-        widget=forms.PasswordInput(attrs={"autocomplete": "current-password", "placeholder": "Your password"}),
+        widget=forms.PasswordInput(attrs={"autocomplete": "current-password", "placeholder": "Your password", "data-password-toggle": "true"}),
     )
+
+    def clean_username(self):
+        return self.cleaned_data["username"].strip()
 
 
 class SignupForm(forms.Form):
-    display_name = forms.CharField(max_length=80, label="Name")
-    student_id = forms.CharField(max_length=9, label="School ID", help_text="Format: YYYY-NNNN")
-    password1 = forms.CharField(label="Create password", widget=forms.PasswordInput)
-    password2 = forms.CharField(label="Confirm password", widget=forms.PasswordInput)
+    """Student self-registration. The role is always Student and cannot be chosen."""
+
+    first_name = forms.CharField(max_length=60, label="First name", widget=forms.TextInput(attrs={"autocomplete": "given-name"}))
+    last_name = forms.CharField(max_length=60, label="Last name", widget=forms.TextInput(attrs={"autocomplete": "family-name"}))
+    student_id = forms.CharField(
+        max_length=9, label="Student ID", help_text="Format: YYYY-NNNN, such as 2024-0122. Only the format is checked.",
+        widget=forms.TextInput(attrs={"placeholder": "2024-0122", "autocomplete": "username"}),
+    )
+    email = forms.EmailField(max_length=254, label="Email address", widget=forms.EmailInput(attrs={"autocomplete": "email"}))
+    password1 = forms.CharField(
+        label="Password", strip=False,
+        help_text="At least 8 characters. Avoid common passwords, passwords that are only numbers, or anything close to your name or ID.",
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password", "data-password-toggle": "true"}),
+    )
+    password2 = forms.CharField(
+        label="Confirm password", strip=False,
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password", "data-password-toggle": "true"}),
+    )
+
+    def clean_first_name(self):
+        return self.cleaned_data["first_name"].strip()
+
+    def clean_last_name(self):
+        return self.cleaned_data["last_name"].strip()
 
     def clean_student_id(self):
         value = self.cleaned_data["student_id"].strip()
         if not STUDENT_ID_PATTERN.fullmatch(value):
-            raise ValidationError("Use the school ID format YYYY-NNNN.")
-        if User.objects.filter(username=value).exists():
-            raise ValidationError("That school ID already has an account.")
-        if Profile.objects.filter(student_id=value).exists():
-            raise ValidationError("That school ID already has an account.")
+            raise ValidationError("Use the Student ID format YYYY-NNNN, such as 2024-0122.")
+        if User.objects.filter(username__iexact=value).exists() or Profile.objects.filter(student_id=value).exists():
+            raise ValidationError("That Student ID already has an account.")
+        return value
+
+    def clean_email(self):
+        value = self.cleaned_data["email"].strip().lower()
+        if email_in_use(value):
+            raise ValidationError("That email address is already used by another account.")
         return value
 
     def clean(self):
         cleaned = super().clean()
-        if cleaned.get("password1") and cleaned.get("password2"):
-            if cleaned["password1"] != cleaned["password2"]:
+        password1, password2 = cleaned.get("password1"), cleaned.get("password2")
+        if password1 and password2:
+            if password1 != password2:
                 self.add_error("password2", "The passwords do not match.")
             else:
-                candidate = User(username=cleaned.get("student_id", ""), first_name=cleaned.get("display_name", ""))
-                try:
-                    from django.contrib.auth.password_validation import validate_password
-                    validate_password(cleaned["password1"], candidate)
-                except ValidationError as exc:
-                    self.add_error("password1", exc)
+                candidate = User(
+                    username=cleaned.get("student_id", ""), email=cleaned.get("email", ""),
+                    first_name=cleaned.get("first_name", ""), last_name=cleaned.get("last_name", ""),
+                )
+                _check_password_strength(self, "password1", password1, candidate)
         return cleaned
 
+    @transaction.atomic
     def save(self):
         user = User.objects.create_user(
             username=self.cleaned_data["student_id"],
-            first_name=self.cleaned_data["display_name"].strip(),
+            email=self.cleaned_data["email"],
+            first_name=self.cleaned_data["first_name"],
+            last_name=self.cleaned_data["last_name"],
             password=self.cleaned_data["password1"],
         )
+        # Role is assigned here, never taken from the submitted form.
+        user.profile.role = Profile.Role.STUDENT
         user.profile.student_id = self.cleaned_data["student_id"]
-        user.profile.save(update_fields=["student_id"])
+        user.profile.save(update_fields=["role", "student_id"])
         return user
 
 
 class StaffAccountForm(forms.Form):
-    display_name = forms.CharField(max_length=80)
+    """Administrator-only form. Always creates a Staff role account."""
+
+    first_name = forms.CharField(max_length=60, label="First name")
+    last_name = forms.CharField(max_length=60, label="Last name", required=False)
     username = forms.RegexField(
-        regex=r"^[A-Za-z0-9._-]{3,32}$",
-        help_text="Use a staff username, not a student ID.",
+        regex=r"^[A-Za-z][A-Za-z0-9._-]{2,31}$",
+        label="Staff username",
+        help_text="3–32 letters, numbers, dots, dashes, or underscores, starting with a letter. Not a student ID.",
+        error_messages={"invalid": "Use 3–32 letters, numbers, dots, dashes, or underscores, starting with a letter."},
     )
-    password = forms.CharField(widget=forms.PasswordInput, min_length=10)
+    email = forms.EmailField(max_length=254, label="Email address", required=False)
+    password = forms.CharField(
+        label="Temporary password", strip=False,
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password", "data-password-toggle": "true"}),
+    )
+    password_confirm = forms.CharField(
+        label="Confirm temporary password", strip=False,
+        widget=forms.PasswordInput(attrs={"autocomplete": "new-password", "data-password-toggle": "true"}),
+    )
 
     def clean_username(self):
         value = self.cleaned_data["username"].strip()
@@ -79,23 +154,141 @@ class StaffAccountForm(forms.Form):
             raise ValidationError("That username is already in use.")
         return value
 
-    def clean_password(self):
-        password = self.cleaned_data["password"]
-        candidate = User(username=self.cleaned_data.get("username", ""), first_name=self.cleaned_data.get("display_name", ""))
-        from django.contrib.auth.password_validation import validate_password
-        validate_password(password, candidate)
-        return password
+    def clean_email(self):
+        value = self.cleaned_data.get("email", "").strip().lower()
+        if value and email_in_use(value):
+            raise ValidationError("That email address is already used by another account.")
+        return value
 
+    def clean(self):
+        cleaned = super().clean()
+        password, confirm = cleaned.get("password"), cleaned.get("password_confirm")
+        if password and confirm:
+            if password != confirm:
+                self.add_error("password_confirm", "The passwords do not match.")
+            else:
+                candidate = User(
+                    username=cleaned.get("username", ""), email=cleaned.get("email", ""),
+                    first_name=cleaned.get("first_name", ""), last_name=cleaned.get("last_name", ""),
+                )
+                _check_password_strength(self, "password", password, candidate)
+        return cleaned
+
+    @transaction.atomic
     def save(self):
         user = User.objects.create_user(
             username=self.cleaned_data["username"],
-            first_name=self.cleaned_data["display_name"].strip(),
+            email=self.cleaned_data.get("email", ""),
+            first_name=self.cleaned_data["first_name"].strip(),
+            last_name=self.cleaned_data.get("last_name", "").strip(),
             password=self.cleaned_data["password"],
         )
         user.profile.role = Profile.Role.STAFF
         user.profile.student_id = None
         user.profile.save(update_fields=["role", "student_id"])
         return user
+
+
+class ProfileForm(forms.Form):
+    """Fields a signed-in user may change on their own profile.
+
+    Student ID, username, role, and account status are deliberately absent.
+    """
+
+    first_name = forms.CharField(max_length=60, label="First name", widget=forms.TextInput(attrs={"autocomplete": "given-name"}))
+    last_name = forms.CharField(max_length=60, label="Last name", required=False, widget=forms.TextInput(attrs={"autocomplete": "family-name"}))
+    email = forms.EmailField(max_length=254, label="Email address", widget=forms.EmailInput(attrs={"autocomplete": "email"}))
+    contact_number = forms.CharField(
+        max_length=20, label="Contact number", required=False,
+        help_text="Optional. Digits, spaces, or dashes, such as 0917 123 4567 or +63 917 123 4567.",
+        widget=forms.TextInput(attrs={"autocomplete": "tel", "inputmode": "tel"}),
+    )
+    photo = forms.ImageField(
+        label="Profile picture", required=False,
+        help_text="Optional. JPG, PNG, or WebP; up to 2 MB.",
+        widget=forms.FileInput(attrs={"accept": "image/jpeg,image/png,image/webp"}),
+    )
+    remove_photo = forms.BooleanField(label="Remove my current profile picture", required=False)
+
+    def __init__(self, *args, user, **kwargs):
+        self.user = user
+        profile = user.profile
+        kwargs.setdefault("initial", {
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "email": user.email,
+            "contact_number": profile.contact_number,
+        })
+        super().__init__(*args, **kwargs)
+
+    def clean_first_name(self):
+        value = self.cleaned_data["first_name"].strip()
+        if not value:
+            raise ValidationError("Enter your first name.")
+        return value
+
+    def clean_last_name(self):
+        return self.cleaned_data.get("last_name", "").strip()
+
+    def clean_email(self):
+        value = self.cleaned_data["email"].strip().lower()
+        if email_in_use(value, exclude_user=self.user):
+            raise ValidationError("That email address is already used by another account.")
+        return value
+
+    def clean_contact_number(self):
+        value = " ".join(self.cleaned_data.get("contact_number", "").split())
+        if not value:
+            return ""
+        digits = re.sub(r"\D", "", value)
+        if not PHONE_PATTERN.fullmatch(value) or not 7 <= len(digits) <= 15:
+            raise ValidationError("Enter a valid contact number using digits, spaces, or dashes.")
+        return value
+
+    def clean_photo(self):
+        photo = self.cleaned_data.get("photo")
+        if photo:
+            validate_profile_photo(photo)
+        return photo
+
+    @transaction.atomic
+    def save(self):
+        user, profile = self.user, self.user.profile
+        user.first_name = self.cleaned_data["first_name"]
+        user.last_name = self.cleaned_data["last_name"]
+        user.email = self.cleaned_data["email"]
+        user.save(update_fields=["first_name", "last_name", "email"])
+        profile.contact_number = self.cleaned_data["contact_number"]
+        old_photo_name = profile.photo.name if profile.photo else ""
+        new_photo = self.cleaned_data.get("photo")
+        if new_photo:
+            profile.photo = new_photo
+        elif self.cleaned_data.get("remove_photo"):
+            profile.photo = None
+        profile.save(update_fields=["contact_number", "photo"])
+        if old_photo_name and old_photo_name != (profile.photo.name if profile.photo else ""):
+            storage = Profile._meta.get_field("photo").storage
+            transaction.on_commit(lambda: storage.delete(old_photo_name))
+        return user
+
+
+class FindItPasswordChangeForm(PasswordChangeForm):
+    """Django's secure password change form with Find-IT labels and show/hide toggles."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        labels = {
+            "old_password": "Current password",
+            "new_password1": "New password",
+            "new_password2": "Confirm new password",
+        }
+        for name, label in labels.items():
+            self.fields[name].label = label
+            self.fields[name].widget.attrs["data-password-toggle"] = "true"
+        self.fields["new_password1"].help_text = (
+            "At least 8 characters. Avoid common passwords, passwords that are only numbers, "
+            "or anything close to your name, ID, or email."
+        )
 
 
 class ItemPostForm(forms.ModelForm):
