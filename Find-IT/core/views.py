@@ -1,31 +1,40 @@
+import os
+
 from django.contrib import messages
 from django.contrib.auth import authenticate, get_user_model, login, logout, update_session_auth_hash
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import AuthenticationForm
 from django.db import IntegrityError, transaction
-from django.db.models import Q
-from django.http import Http404, HttpResponseForbidden, JsonResponse
+from django.core.exceptions import ValidationError
+from django.core.paginator import Paginator
+from django.db.models import Count, Q
+from django.http import FileResponse, Http404, HttpResponseForbidden, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
 from .forms import (
-    AdminReviewForm, ClaimAnswerForm, CloseReasonForm, CommentForm,
+    AdminAccountForm, ClaimAnswerForm, GeneralReportForm, ModeratorDecisionForm, ReportReviewForm, CloseReasonForm, CommentForm,
     FindItLoginForm, FindItPasswordChangeForm, ItemPostForm, ProfileForm, ReportForm, SignupForm, StaffAccountForm,
     SystemSettingsForm,
 )
 from .models import (
-    AbuseReport, ClaimAnswer, ClaimApplication, Comment, Conversation,
-    InAppNotification, ItemPost, PostStatusEvent, Profile, StaffAuditLog,
+    OPEN_REPORT_STATUSES, AbuseReport, ClaimAnswer, ClaimApplication, Comment, Conversation, GeneralReport,
+    InAppNotification, ItemPost, ModeratorVerification, ModeratorVerificationEvent, ReportStatus, PostStatusEvent, Profile, StaffAuditLog,
     SystemSettings, VerificationQuestion,
 )
-from .permissions import is_admin, is_staff_or_admin, role_of
+from .permissions import (
+    can_review_private_chats, can_review_reports, is_admin, is_staff_or_admin, role_of,
+)
 from .services import (
     archive_post, audit, close_claim, close_post, confirm_claimed,
     create_claim_conversation, create_lost_post_conversation, notify_user, record_status,
     return_to_claimant, turn_over_to_guardhouse,
+    ModeratorTransitionError, change_moderator_verification, record_report_submission,
+    review_report_status, revoke_moderator_if_not_staff,
 )
 
 User = get_user_model()
@@ -477,25 +486,28 @@ def chat_room(request, conversation_id):
         Conversation.objects.select_related("post", "initiator", "recipient"),
         pk=conversation_id,
     )
-    staff_view = is_staff_or_admin(request.user) and not conversation.includes(request.user)
+    reviewer = can_review_private_chats(request.user)
+    staff_view = reviewer and not conversation.includes(request.user)
     if not conversation.includes(request.user) and not staff_view:
-        return HttpResponseForbidden("This conversation is private to its participants and authorized staff.")
-    if is_staff_or_admin(request.user):
-        audit(request.user, "reviewed_chat", conversation, "Staff opened private chat history.")
+        return HttpResponseForbidden("This conversation is private to its participants and authorized reviewers.")
+    if staff_view:
+        audit(request.user, "reviewed_chat", conversation, "Authorized reviewer opened private chat history.")
     messages_qs = conversation.messages.select_related("sender").all()
     return render(request, "core/chat_room.html", {
         "conversation": conversation,
         "chat_messages": messages_qs,
         "staff_view": staff_view,
         "can_send": conversation.includes(request.user) and not conversation.is_closed and not conversation.is_paused,
+        "is_reviewer": reviewer,
+        "can_report": conversation.includes(request.user) or reviewer,
     })
 
 
 @login_required
 @require_POST
 def pause_chat(request, conversation_id):
-    if not is_staff_or_admin(request.user):
-        return HttpResponseForbidden("Only staff can pause a conversation.")
+    if not can_review_private_chats(request.user):
+        return HttpResponseForbidden("Only administrators and verified moderators can pause a conversation.")
     conversation = get_object_or_404(Conversation, pk=conversation_id)
     reason = request.POST.get("reason", "").strip()[:240] or "Paused for staff review."
     conversation.is_paused = True
@@ -503,7 +515,7 @@ def pause_chat(request, conversation_id):
     conversation.save(update_fields=["is_paused", "pause_reason", "updated_at"])
     audit(request.user, "paused_chat", conversation, reason)
     for participant in {conversation.initiator, conversation.recipient}:
-        notify_user(participant, conversation.post, "A staff member paused this conversation for review.", conversation.claim)
+        notify_user(participant, conversation.post, "An authorized reviewer paused this conversation for review.", conversation.claim)
     messages.success(request, "Chat paused. The participants can still read its history.")
     return redirect("chat-room", conversation_id=conversation.pk)
 
@@ -528,29 +540,37 @@ def unpause_chat(request, conversation_id):
 
 
 @login_required
-@require_POST
 def report_chat(request, conversation_id):
-    if not is_staff_or_admin(request.user):
-        return HttpResponseForbidden("Only staff can submit reports for administrator review.")
-    conversation = get_object_or_404(Conversation, pk=conversation_id)
-    form = ReportForm(request.POST)
-    if form.is_valid():
-        target_id = request.POST.get("target_user_id") or None
-        if target_id and str(target_id) not in {str(conversation.initiator_id), str(conversation.recipient_id)}:
-            return HttpResponseForbidden("The reported account must be a participant in this conversation.")
-        report = form.save(commit=False)
-        report.reporter = request.user
-        report.conversation = conversation
-        report.target_user_id = target_id
-        report.save()
-        conversation.is_paused = True
-        conversation.pause_reason = "Reported for administrator review."
-        conversation.save(update_fields=["is_paused", "pause_reason", "updated_at"])
-        audit(request.user, "reported_chat", report, "Sent to administrators.")
-        messages.success(request, "Report submitted to administrators; chat paused for review.")
-    else:
-        messages.error(request, "Choose a report reason.")
-    return redirect("chat-room", conversation_id=conversation.pk)
+    """Participants report the other person; authorized reviewers can also file a report."""
+    conversation = get_object_or_404(Conversation.objects.select_related("post", "initiator", "recipient"), pk=conversation_id)
+    is_participant = conversation.includes(request.user)
+    reviewer = can_review_private_chats(request.user)
+    if not is_participant and not reviewer:
+        return HttpResponseForbidden("Only participants and authorized reviewers can report this conversation.")
+    form = ReportForm(
+        request.POST if request.method == "POST" else None, conversation=conversation, reporter=request.user,
+    )
+    if request.method == "POST":
+        if form.is_valid():
+            report = form.save(commit=False)
+            report.reporter = request.user
+            report.conversation = conversation
+            report.target_user_id = form.cleaned_data["target_user"]
+            report.reported_message_id = form.cleaned_data.get("reported_message")
+            report.save()
+            record_report_submission(report, request.user)
+            if reviewer and not is_participant:
+                conversation.is_paused = True
+                conversation.pause_reason = "Reported for safety review."
+                conversation.save(update_fields=["is_paused", "pause_reason", "updated_at"])
+            audit(request.user, "reported_chat", report, report.reference)
+            messages.success(
+                request,
+                f"Report {report.reference} was submitted for review. No account is restricted until an authorized reviewer decides.",
+            )
+            return redirect("chat-room", conversation_id=conversation.pk)
+        messages.error(request, "Your report was not submitted. Fix the highlighted fields and try again.")
+    return render(request, "core/chat_report_form.html", {"form": form, "conversation": conversation})
 
 
 @login_required
@@ -576,16 +596,31 @@ def staff_dashboard(request):
         return HttpResponseForbidden("Staff access is required.")
     posts = ItemPost.objects.filter(is_archived=False).select_related("author").prefetch_related("claims")
     conversations = Conversation.objects.select_related("post", "initiator", "recipient")[:100]
+    reviewer = can_review_reports(request.user)
     return render(request, "core/staff_dashboard.html", {
         "posts": posts[:100],
-        "conversations": conversations,
-        "recent_reports": AbuseReport.objects.filter(status=AbuseReport.Status.PENDING)[:20],
+        "conversations": conversations if reviewer else [],
+        "recent_reports": AbuseReport.objects.filter(status__in=OPEN_REPORT_STATUSES)[:20] if reviewer else [],
+        "open_general_count": GeneralReport.objects.filter(status__in=OPEN_REPORT_STATUSES).count() if reviewer else 0,
         "is_admin": is_admin(request.user),
+        "is_reviewer": reviewer,
+        "moderator_status": ModeratorVerification.objects.filter(staff=request.user).first(),
     })
+
+
+def _paginate(request, queryset, per_page=20):
+    return Paginator(queryset, per_page).get_page(request.GET.get("page"))
+
+
+def _querystring_without_page(request):
+    params = request.GET.copy()
+    params.pop("page", None)
+    return params.urlencode()
 
 
 @login_required
 def staff_accounts(request):
+    """Administrator account management: create staff, search, filter, and open any account."""
     if not is_admin(request.user):
         return HttpResponseForbidden("Administrator access is required.")
     form = StaffAccountForm(request.POST if request.method == "POST" else None)
@@ -596,45 +631,195 @@ def staff_accounts(request):
             messages.success(request, f"Staff account for {user.get_full_name() or user.username} was created.")
             return redirect("staff-accounts")
         messages.error(request, "The staff account was not created. Fix the highlighted fields and try again.")
-    staff_users = User.objects.filter(profile__role=Profile.Role.STAFF).order_by("first_name", "username")
-    role_filter = request.GET.get("role", "").strip()
+    staff_users = (
+        User.objects.filter(profile__role=Profile.Role.STAFF)
+        .select_related("profile", "moderator_verification").order_by("first_name", "username")
+    )
     accounts = User.objects.select_related("profile").order_by("profile__role", "first_name", "username")
+    q = request.GET.get("q", "").strip()[:80]
+    role_filter = request.GET.get("role", "").strip()
+    status_filter = request.GET.get("status", "").strip()
+    if q:
+        accounts = accounts.filter(
+            Q(username__icontains=q) | Q(first_name__icontains=q) | Q(last_name__icontains=q) | Q(email__icontains=q)
+        )
     if role_filter in dict(Profile.Role.choices):
         accounts = accounts.filter(profile__role=role_filter)
     else:
         role_filter = ""
+    if status_filter in {"active", "inactive"}:
+        accounts = accounts.filter(is_active=status_filter == "active")
+    else:
+        status_filter = ""
     return render(request, "core/staff_accounts.html", {
         "form": form,
         "staff_users": staff_users,
-        "accounts": accounts[:300],
+        "page_obj": _paginate(request, accounts, 20),
+        "querystring": _querystring_without_page(request),
+        "q": q,
         "role_filter": role_filter,
+        "status_filter": status_filter,
         "role_choices": Profile.Role.choices,
     })
+
+
+def _account_lock_reason(account, admin_user):
+    if account.pk == admin_user.pk:
+        return "You cannot change your own role or status."
+    if account.is_superuser:
+        return "Django superusers are managed in Django administration."
+    return ""
+
+
+def _is_last_active_admin(account):
+    if not (account.is_active and role_of(account) == Profile.Role.ADMIN):
+        return False
+    return not User.objects.filter(is_active=True).filter(
+        Q(profile__role=Profile.Role.ADMIN) | Q(is_superuser=True)
+    ).exclude(pk=account.pk).exists()
 
 
 @login_required
 @require_POST
 def staff_account_status(request, user_id):
-    """Administrators activate or suspend Staff accounts only. Roles are never changed here."""
+    """Administrators activate or deactivate accounts. Roles are never changed here."""
     if not is_admin(request.user):
         return HttpResponseForbidden("Administrator access is required.")
     target = get_object_or_404(User.objects.select_related("profile"), pk=user_id)
-    if target.pk == request.user.pk or target.is_superuser or role_of(target) != Profile.Role.STAFF:
-        return HttpResponseForbidden("Only staff accounts can be activated or suspended here.")
+    lock = _account_lock_reason(target, request.user)
+    if lock:
+        return HttpResponseForbidden(lock)
     action = request.POST.get("action")
-    if action == "suspend":
-        target.is_active = False
-        message = f"{target.get_full_name() or target.username} was suspended and can no longer sign in."
-    elif action == "activate":
-        target.is_active = True
-        message = f"{target.get_full_name() or target.username} was activated."
-    else:
-        messages.error(request, "Choose activate or suspend.")
-        return redirect("staff-accounts")
+    if action not in {"suspend", "activate"}:
+        messages.error(request, "Choose activate or deactivate.")
+        return redirect(_safe_next(request, fallback="staff-accounts"))
+    if action == "suspend" and _is_last_active_admin(target):
+        messages.error(request, "At least one active administrator must remain.")
+        return redirect(_safe_next(request, fallback="staff-accounts"))
+    target.is_active = action == "activate"
     target.save(update_fields=["is_active"])
-    audit(request.user, f"{action}_staff_account", target, f"Staff account {action}d by administrator.")
-    messages.success(request, message)
-    return redirect("staff-accounts")
+    name = target.get_full_name() or target.username
+    audit(request.user, f"{action}_account", target, f"{role_of(target)} account {'activated' if target.is_active else 'deactivated'} by administrator.")
+    messages.success(request, f"{name} was {'activated' if target.is_active else 'deactivated and can no longer sign in'}.")
+    return redirect(_safe_next(request, fallback="staff-accounts"))
+
+
+@login_required
+def edit_account(request, user_id):
+    """Administrator edit of any account. Superusers and the admin's own role/status are locked."""
+    if not is_admin(request.user):
+        return HttpResponseForbidden("Administrator access is required.")
+    account = get_object_or_404(User.objects.select_related("profile"), pk=user_id)
+    form = AdminAccountForm(
+        request.POST if request.method == "POST" else None, account=account, acting_admin=request.user,
+    )
+    if request.method == "POST":
+        if form.is_valid():
+            changes = form.save()
+            revoke_moderator_if_not_staff(account, request.user)
+            audit(request.user, "edited_account", account, "; ".join(["details updated", *changes]))
+            messages.success(request, f"Account {account.username} was updated.")
+            return redirect("edit-account", user_id=account.pk)
+        messages.error(request, "The account was not saved. Fix the highlighted fields and try again.")
+    verification = ModeratorVerification.objects.filter(staff=account).first()
+    return render(request, "core/account_edit.html", {
+        "form": form, "account": account, "verification": verification,
+        "recent_activity": StaffAuditLog.objects.filter(target_type="User", target_id=str(account.pk))[:10],
+    })
+
+
+@login_required
+def admin_dashboard(request):
+    """Administrator overview. Every number is counted from the database on each visit."""
+    if not is_admin(request.user):
+        return HttpResponseForbidden("Administrator access is required.")
+    users = User.objects.all()
+    admin_q = Q(profile__role=Profile.Role.ADMIN) | Q(is_superuser=True)
+    account_counts = users.aggregate(
+        total=Count("pk"),
+        students=Count("pk", filter=Q(profile__role=Profile.Role.STUDENT, is_superuser=False)),
+        staff=Count("pk", filter=Q(profile__role=Profile.Role.STAFF, is_superuser=False)),
+        admins=Count("pk", filter=admin_q),
+        active=Count("pk", filter=Q(is_active=True)),
+        inactive=Count("pk", filter=Q(is_active=False)),
+    )
+    verification_counts = {
+        value: ModeratorVerification.objects.filter(status=value).count()
+        for value in ModeratorVerification.Status.values
+    }
+
+    def report_counts(model):
+        counts = {value: 0 for value in ReportStatus.values}
+        for row in model.objects.values("status").annotate(n=Count("pk")):
+            counts[row["status"]] = row["n"]
+        counts["TOTAL"] = sum(counts.values())
+        return counts
+
+    return render(request, "core/admin_dashboard.html", {
+        "account_counts": account_counts,
+        "verification_counts": verification_counts,
+        "chat_counts": report_counts(AbuseReport),
+        "general_counts": report_counts(GeneralReport),
+        "pending_verifications": ModeratorVerification.objects.filter(
+            status=ModeratorVerification.Status.PENDING).select_related("staff")[:5],
+        "recent_verification_events": ModeratorVerificationEvent.objects.select_related(
+            "verification__staff", "actor")[:5],
+        "open_chat_reports": AbuseReport.objects.filter(status__in=OPEN_REPORT_STATUSES).select_related("reporter", "target_user")[:5],
+        "open_general_reports": GeneralReport.objects.filter(status__in=OPEN_REPORT_STATUSES).select_related("reporter", "post")[:5],
+        "report_status_choices": ReportStatus.choices,
+    })
+
+
+@login_required
+def moderator_verifications(request):
+    if not is_admin(request.user):
+        return HttpResponseForbidden("Administrator access is required.")
+    staff_users = (
+        User.objects.filter(profile__role=Profile.Role.STAFF, is_superuser=False)
+        .select_related("profile", "moderator_verification", "moderator_verification__reviewed_by")
+        .order_by("first_name", "username")
+    )
+    status_filter = request.GET.get("status", "").strip()
+    if status_filter == "NONE":
+        staff_users = staff_users.filter(moderator_verification__isnull=True)
+    elif status_filter in ModeratorVerification.Status.values:
+        staff_users = staff_users.filter(moderator_verification__status=status_filter)
+    else:
+        status_filter = ""
+    history = ModeratorVerificationEvent.objects.select_related("verification__staff", "actor")
+    return render(request, "core/moderator_verifications.html", {
+        "staff_users": staff_users,
+        "status_filter": status_filter,
+        "status_choices": ModeratorVerification.Status.choices,
+        "counts": {value: ModeratorVerification.objects.filter(status=value).count() for value in ModeratorVerification.Status.values},
+        "unrequested_count": User.objects.filter(
+            profile__role=Profile.Role.STAFF, is_superuser=False, moderator_verification__isnull=True).count(),
+        "history_page": _paginate(request, history, 15),
+        "querystring": _querystring_without_page(request),
+    })
+
+
+@login_required
+@require_POST
+def moderator_verification_action(request, user_id):
+    if not is_admin(request.user):
+        return HttpResponseForbidden("Administrator access is required.")
+    staff_user = get_object_or_404(User.objects.select_related("profile"), pk=user_id)
+    form = ModeratorDecisionForm(request.POST)
+    if not form.is_valid():
+        messages.error(request, "Choose a valid moderator action.")
+        return redirect("moderator-verifications")
+    try:
+        verification = change_moderator_verification(
+            staff_user, request.user, form.cleaned_data["action"], form.cleaned_data["remarks"],
+        )
+    except ModeratorTransitionError as exc:
+        messages.error(request, str(exc))
+    else:
+        messages.success(
+            request, f"Moderator status for {staff_user.get_full_name() or staff_user.username} is now {verification.get_status_display()}.",
+        )
+    return redirect(_safe_next(request, fallback="moderator-verifications"))
 
 
 @login_required
@@ -653,45 +838,209 @@ def admin_settings(request):
     return render(request, "core/admin_settings.html", {"form": form, "settings_row": settings_row})
 
 
+def _filtered_reports(request, queryset, category_field, category_choices, search_fields):
+    """Shared search, category, status, and date filters for report lists."""
+    filters = {
+        "q": request.GET.get("q", "").strip()[:80],
+        "category": request.GET.get("category", "").strip(),
+        "status": request.GET.get("status", "").strip(),
+        "date_from": request.GET.get("date_from", "").strip(),
+        "date_to": request.GET.get("date_to", "").strip(),
+    }
+    if filters["q"]:
+        query = Q()
+        for field in search_fields:
+            query |= Q(**{f"{field}__icontains": filters["q"]})
+        queryset = queryset.filter(query)
+    if filters["category"] in dict(category_choices):
+        queryset = queryset.filter(**{category_field: filters["category"]})
+    else:
+        filters["category"] = ""
+    if filters["status"] == "OPEN":
+        queryset = queryset.filter(status__in=OPEN_REPORT_STATUSES)
+    elif filters["status"] in ReportStatus.values:
+        queryset = queryset.filter(status=filters["status"])
+    else:
+        filters["status"] = ""
+    for key, lookup in (("date_from", "created_at__date__gte"), ("date_to", "created_at__date__lte")):
+        parsed = parse_date(filters[key]) if filters[key] else None
+        if parsed:
+            queryset = queryset.filter(**{lookup: parsed})
+        else:
+            filters[key] = ""
+    return queryset, filters
+
+
+def _report_list_context(request, queryset, filters, category_choices, **extra):
+    return {
+        "page_obj": _paginate(request, queryset, 20),
+        "querystring": _querystring_without_page(request),
+        "filters": filters,
+        "category_choices": category_choices,
+        "status_choices": ReportStatus.choices,
+        **extra,
+    }
+
+
 @login_required
 def admin_reports(request):
-    if not is_admin(request.user):
-        return HttpResponseForbidden("Administrator access is required.")
-    reports = AbuseReport.objects.select_related("reporter", "target_user", "conversation", "conversation__post", "reviewed_by")
-    return render(request, "core/admin_reports.html", {"reports": reports[:200]})
+    """Chat safety report queue for administrators and verified moderators."""
+    if not can_review_reports(request.user):
+        return HttpResponseForbidden("Administrator or verified moderator access is required.")
+    reports = AbuseReport.objects.select_related(
+        "reporter", "target_user", "conversation", "conversation__post", "assigned_reviewer", "reviewed_by",
+    )
+    reports, filters = _filtered_reports(
+        request, reports, "reason", AbuseReport.Reason.choices,
+        ["reference", "details", "reporter__username", "reporter__first_name", "target_user__username", "target_user__first_name"],
+    )
+    return render(request, "core/admin_reports.html", _report_list_context(
+        request, reports, filters, AbuseReport.Reason.choices,
+    ))
 
 
 @login_required
-@require_POST
 def review_report(request, report_id):
-    if not is_admin(request.user):
-        return HttpResponseForbidden("Only administrators can decide account restrictions.")
-    report = get_object_or_404(AbuseReport.objects.select_related("target_user"), pk=report_id)
-    form = AdminReviewForm(request.POST)
-    if not form.is_valid():
-        messages.error(request, "Choose an administrator action.")
-        return redirect("admin-reports")
-    action = form.cleaned_data["action"]
-    if action == "suspend" and report.target_user:
-        report.target_user.is_active = False
-        report.target_user.save(update_fields=["is_active"])
-        report.status = AbuseReport.Status.ACTION_TAKEN
-        decision = "Account suspended."
-    elif action == "restore" and report.target_user:
-        report.target_user.is_active = True
-        report.target_user.save(update_fields=["is_active"])
-        report.status = AbuseReport.Status.ACTION_TAKEN
-        decision = "Account restored."
+    """Chat safety report detail and review form."""
+    if not can_review_reports(request.user):
+        return HttpResponseForbidden("Administrator or verified moderator access is required.")
+    report = get_object_or_404(AbuseReport.objects.select_related(
+        "reporter", "target_user", "conversation", "conversation__post", "reported_message",
+        "reported_message__sender", "assigned_reviewer", "reviewed_by",
+    ), pk=report_id)
+    admin_user = is_admin(request.user)
+    can_change_account = (
+        admin_user and report.target_user is not None and not report.target_user.is_superuser
+        and report.target_user_id != request.user.pk and role_of(report.target_user) != Profile.Role.ADMIN
+    )
+    form = ReportReviewForm(
+        request.POST if request.method == "POST" else None, report=report, allow_account_action=can_change_account,
+    )
+    if request.method == "POST":
+        if form.is_valid():
+            action = form.cleaned_data["action"]
+            remarks = form.cleaned_data["remarks"]
+            account_action = form.cleaned_data.get("account_action")
+            if account_action:
+                report.target_user.is_active = account_action == "restore"
+                report.target_user.save(update_fields=["is_active"])
+                decision = "Account suspended." if account_action == "suspend" else "Account restored."
+                audit(request.user, f"{account_action}_account", report.target_user, f"Decision on {report.reference}.")
+                remarks = f"{decision} {remarks}".strip()
+            review_report_status(report, request.user, action, remarks)
+            messages.success(request, f"Report {report.reference} updated: {report.get_status_display()}.")
+            return redirect("review-report", report_id=report.pk)
+        messages.error(request, "The review was not saved. Check the highlighted fields.")
     else:
-        report.status = AbuseReport.Status.RESOLVED
-        decision = "Report resolved without account action."
-    report.admin_note = form.cleaned_data["admin_note"]
-    report.reviewed_by = request.user
-    report.resolved_at = timezone.now()
-    report.save(update_fields=["status", "admin_note", "reviewed_by", "resolved_at"])
-    audit(request.user, "reviewed_report", report, decision)
-    messages.success(request, decision)
-    return redirect("admin-reports")
+        audit(request.user, "viewed_chat_report", report, report.reference)
+    return render(request, "core/chat_report_detail.html", {
+        "report": report,
+        "form": form,
+        "events": report.events.select_related("actor"),
+        "context_messages": _messages_around(report),
+    })
+
+
+def _messages_around(report):
+    """A few messages before and after the reported one, for reviewer context."""
+    if not report.reported_message_id or not report.conversation_id:
+        return []
+    message = report.reported_message
+    qs = report.conversation.messages.select_related("sender")
+    before = list(qs.filter(sent_at__lt=message.sent_at).order_by("-sent_at")[:3])[::-1]
+    after = list(qs.filter(sent_at__gt=message.sent_at).order_by("sent_at")[:3])
+    return before + [message] + after
+
+
+@login_required
+def general_report_create(request):
+    post = None
+    post_id = request.GET.get("post") or request.POST.get("post")
+    if post_id:
+        try:
+            post = ItemPost.objects.filter(pk=post_id).first()
+        except (ValueError, ValidationError):
+            post = None
+    form = GeneralReportForm(
+        request.POST if request.method == "POST" else None,
+        request.FILES if request.method == "POST" else None,
+    )
+    if post is None:
+        form.fields["category"].initial = GeneralReport.Category.TECHNICAL
+    if request.method == "POST":
+        if form.is_valid():
+            report = form.save(commit=False)
+            report.reporter = request.user
+            report.post = post
+            report.save()
+            record_report_submission(report, request.user)
+            messages.success(request, f"Report {report.reference} was submitted. You can follow its status under My reports.")
+            return redirect("my-reports")
+        messages.error(request, "Your report was not submitted. Fix the highlighted fields and try again.")
+    return render(request, "core/general_report_form.html", {"form": form, "post": post})
+
+
+@login_required
+def general_reports(request):
+    if not can_review_reports(request.user):
+        return HttpResponseForbidden("Administrator or verified moderator access is required.")
+    reports = GeneralReport.objects.select_related("reporter", "post", "assigned_reviewer", "reviewed_by")
+    reports, filters = _filtered_reports(
+        request, reports, "category", GeneralReport.Category.choices,
+        ["reference", "description", "reporter__username", "reporter__first_name", "post__title"],
+    )
+    return render(request, "core/general_reports.html", _report_list_context(
+        request, reports, filters, GeneralReport.Category.choices,
+    ))
+
+
+@login_required
+def general_report_detail(request, report_id):
+    if not can_review_reports(request.user):
+        return HttpResponseForbidden("Administrator or verified moderator access is required.")
+    report = get_object_or_404(GeneralReport.objects.select_related(
+        "reporter", "post", "post__author", "assigned_reviewer", "reviewed_by",
+    ), pk=report_id)
+    form = ReportReviewForm(request.POST if request.method == "POST" else None, report=report)
+    if request.method == "POST":
+        if form.is_valid():
+            review_report_status(report, request.user, form.cleaned_data["action"], form.cleaned_data["remarks"])
+            messages.success(request, f"Report {report.reference} updated: {report.get_status_display()}.")
+            return redirect("general-report-detail", report_id=report.pk)
+        messages.error(request, "The review was not saved. Check the highlighted fields.")
+    return render(request, "core/general_report_detail.html", {
+        "report": report, "form": form, "events": report.events.select_related("actor"),
+    })
+
+
+@login_required
+def general_report_attachment(request, report_id):
+    """Serve a report attachment only to its reporter and authorized reviewers."""
+    report = get_object_or_404(GeneralReport, pk=report_id)
+    if report.reporter_id != request.user.pk and not can_review_reports(request.user):
+        return HttpResponseForbidden("You cannot open this attachment.")
+    if not report.attachment:
+        raise Http404
+    try:
+        handle = report.attachment.open("rb")
+    except FileNotFoundError:
+        raise Http404
+    name = os.path.basename(report.attachment.name)
+    is_pdf = name.lower().endswith(".pdf")
+    response = FileResponse(handle, as_attachment=is_pdf, filename=f"{report.reference}{os.path.splitext(name)[1]}")
+    response["X-Content-Type-Options"] = "nosniff"
+    response["Cache-Control"] = "private, no-store"
+    response["Content-Security-Policy"] = "default-src 'none'; img-src 'self'; sandbox"
+    return response
+
+
+@login_required
+def my_reports(request):
+    """A user's own submitted reports. Internal remarks are never shown here."""
+    return render(request, "core/my_reports.html", {
+        "chat_reports": AbuseReport.objects.filter(reporter=request.user).select_related("target_user", "conversation__post"),
+        "general_reports": GeneralReport.objects.filter(reporter=request.user).select_related("post"),
+    })
 
 
 @login_required

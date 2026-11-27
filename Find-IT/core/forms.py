@@ -6,9 +6,13 @@ from django.contrib.auth.forms import AuthenticationForm, PasswordChangeForm, Se
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
 
-from .models import ItemPost, SystemSettings, AbuseReport, Profile
-from .validators import validate_photo, validate_profile_photo
+from .models import (
+    CLOSED_REPORT_STATUSES, AbuseReport, GeneralReport, ItemPost, Profile, ReportStatus, SystemSettings,
+)
+from .validators import validate_photo, validate_profile_photo, validate_report_attachment
 
 User = get_user_model()
 STUDENT_ID_PATTERN = re.compile(r"^\d{4}-\d{4}$")
@@ -349,10 +353,218 @@ class ClaimAnswerForm(forms.Form):
 
 
 class ReportForm(forms.ModelForm):
+    """Chat safety report submitted from a conversation by a participant or an authorized reviewer."""
+
+    target_user = forms.TypedChoiceField(label="Account being reported", coerce=int, empty_value=None)
+    reported_message = forms.TypedChoiceField(
+        label="Specific message (optional)", coerce=int, empty_value=None, required=False,
+    )
+
     class Meta:
         model = AbuseReport
         fields = ["reason", "details"]
-        widgets = {"details": forms.Textarea(attrs={"rows": 4})}
+        labels = {"reason": "Category", "details": "What happened?"}
+        widgets = {"details": forms.Textarea(attrs={"rows": 4, "maxlength": 1500})}
+
+    def __init__(self, *args, conversation, reporter, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.conversation = conversation
+        self.reporter = reporter
+        participants = [conversation.initiator, conversation.recipient]
+        choices = [(u.pk, u.get_full_name() or u.username) for u in participants if u.pk != reporter.pk]
+        self.fields["target_user"].choices = [("", "Choose account")] + choices
+        if len(choices) == 1:
+            self.fields["target_user"].initial = choices[0][0]
+        recent = conversation.messages.exclude(sender=reporter).select_related("sender").order_by("-sent_at")[:30]
+        self.fields["reported_message"].choices = [("", "Not a specific message")] + [
+            (m.pk, f"{m.sender.first_name or m.sender.username}, {timezone.localtime(m.sent_at):%b %d %H:%M}: {m.text[:60]}")
+            for m in recent
+        ]
+        self.fields["details"].required = True
+        self.fields["reason"].choices = [("", "Choose a category")] + list(AbuseReport.Reason.choices)
+
+    def clean_details(self):
+        value = self.cleaned_data["details"].strip()
+        if len(value) < 10:
+            raise ValidationError("Describe what happened in at least 10 characters.")
+        return value
+
+    def clean_target_user(self):
+        value = self.cleaned_data["target_user"]
+        if value not in {self.conversation.initiator_id, self.conversation.recipient_id} or value == self.reporter.pk:
+            raise ValidationError("Choose the other participant in this conversation.")
+        return value
+
+    def clean_reported_message(self):
+        value = self.cleaned_data.get("reported_message")
+        if value and not self.conversation.messages.filter(pk=value).exclude(sender=self.reporter).exists():
+            raise ValidationError("Choose a message from this conversation.")
+        return value
+
+
+class GeneralReportForm(forms.ModelForm):
+    class Meta:
+        model = GeneralReport
+        fields = ["category", "description", "attachment"]
+        labels = {"description": "Describe the issue", "attachment": "Screenshot or attachment (optional)"}
+        help_texts = {"attachment": "JPG, PNG, WebP, or PDF; up to 5 MB. Only you and authorized reviewers can open it."}
+        widgets = {
+            "description": forms.Textarea(attrs={"rows": 5, "maxlength": 2000}),
+            "attachment": forms.ClearableFileInput(attrs={"accept": "image/jpeg,image/png,image/webp,application/pdf"}),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["category"].choices = [("", "Choose a category")] + list(GeneralReport.Category.choices)
+
+    def clean_description(self):
+        value = self.cleaned_data["description"].strip()
+        if len(value) < 10:
+            raise ValidationError("Describe the issue in at least 10 characters.")
+        return value
+
+    def clean_attachment(self):
+        attachment = self.cleaned_data.get("attachment")
+        if attachment and hasattr(attachment, "content_type"):
+            validate_report_attachment(attachment)
+        return attachment
+
+
+class ReportReviewForm(forms.Form):
+    """Reviewer action on a chat safety report or general report."""
+
+    ACTION_NOTE = "NOTE"
+    action = forms.ChoiceField(label="Action", choices=[
+        (ACTION_NOTE, "Add remarks only (keep status)"),
+        (ReportStatus.UNDER_REVIEW, "Mark as Under Review"),
+        (ReportStatus.RESOLVED, "Resolve"),
+        (ReportStatus.DISMISSED, "Dismiss (no action needed)"),
+    ])
+    remarks = forms.CharField(
+        label="Internal remarks", max_length=1500, required=False,
+        help_text="Only administrators and verified moderators can see these remarks.",
+        widget=forms.Textarea(attrs={"rows": 3, "maxlength": 1500}),
+    )
+    account_action = forms.ChoiceField(label="Account decision (administrators only)", required=False, choices=[
+        ("", "No account change"),
+        ("suspend", "Suspend the reported account"),
+        ("restore", "Restore the reported account"),
+    ])
+
+    def __init__(self, *args, report, allow_account_action=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.report = report
+        if not allow_account_action:
+            del self.fields["account_action"]
+
+    def clean(self):
+        cleaned = super().clean()
+        action = cleaned.get("action")
+        status = self.report.status
+        if action == self.ACTION_NOTE and not cleaned.get("remarks", "").strip():
+            self.add_error("remarks", "Write the remarks to add.")
+        if action == ReportStatus.UNDER_REVIEW and status != ReportStatus.SUBMITTED and status not in CLOSED_REPORT_STATUSES:
+            self.add_error("action", "This report is already under review.")
+        if action in CLOSED_REPORT_STATUSES and status in CLOSED_REPORT_STATUSES:
+            self.add_error("action", "This report is already closed. Reopen it as Under Review first.")
+        if action == ReportStatus.DISMISSED and cleaned.get("account_action"):
+            self.add_error("account_action", "A dismissed report cannot change an account.")
+        if cleaned.get("account_action") and action != ReportStatus.RESOLVED:
+            self.add_error("account_action", "Account decisions are recorded when resolving a report.")
+        return cleaned
+
+
+class AdminAccountForm(forms.Form):
+    """Administrator edit of another account's details, role, and status."""
+
+    first_name = forms.CharField(max_length=60, label="First name")
+    last_name = forms.CharField(max_length=60, label="Last name", required=False)
+    email = forms.EmailField(max_length=254, label="Email address", required=False)
+    contact_number = forms.CharField(max_length=20, label="Contact number", required=False)
+    role = forms.ChoiceField(label="Role", choices=Profile.Role.choices)
+    is_active = forms.TypedChoiceField(
+        label="Account status", coerce=lambda v: v == "1", choices=[("1", "Active"), ("0", "Inactive (suspended)")],
+    )
+
+    def __init__(self, *args, account, acting_admin, **kwargs):
+        self.account = account
+        self.acting_admin = acting_admin
+        kwargs.setdefault("initial", {
+            "first_name": account.first_name, "last_name": account.last_name, "email": account.email,
+            "contact_number": account.profile.contact_number, "role": account.profile.role,
+            "is_active": "1" if account.is_active else "0",
+        })
+        super().__init__(*args, **kwargs)
+        self.locked_reason = ""
+        if account.pk == acting_admin.pk:
+            self.locked_reason = "You cannot change your own role or status. Another administrator must do it."
+        elif account.is_superuser:
+            self.locked_reason = "This is a Django superuser. Change its role or status in Django administration."
+        if self.locked_reason:
+            for name in ("role", "is_active"):
+                self.fields[name].disabled = True
+        if not account.profile.student_id:
+            self.fields["role"].help_text = "Student role needs a Student ID, so it is only available for accounts that registered as students."
+
+    def clean_first_name(self):
+        value = self.cleaned_data["first_name"].strip()
+        if not value:
+            raise ValidationError("Enter a first name.")
+        return value
+
+    def clean_last_name(self):
+        return self.cleaned_data.get("last_name", "").strip()
+
+    def clean_email(self):
+        value = self.cleaned_data.get("email", "").strip().lower()
+        if value and email_in_use(value, exclude_user=self.account):
+            raise ValidationError("That email address is already used by another account.")
+        return value
+
+    clean_contact_number = ProfileForm.clean_contact_number
+
+    def clean(self):
+        cleaned = super().clean()
+        role, active = cleaned.get("role"), cleaned.get("is_active")
+        if role == Profile.Role.STUDENT and not self.account.profile.student_id:
+            self.add_error("role", "This account has no Student ID, so it cannot become a Student.")
+        currently_admin = self.account.profile.role == Profile.Role.ADMIN and self.account.is_active
+        if currently_admin and (role != Profile.Role.ADMIN or active is False):
+            other_admins = User.objects.filter(is_active=True).filter(
+                Q(profile__role=Profile.Role.ADMIN) | Q(is_superuser=True)
+            ).exclude(pk=self.account.pk)
+            if not other_admins.exists():
+                raise ValidationError("At least one active administrator must remain.")
+        return cleaned
+
+    @transaction.atomic
+    def save(self):
+        account, profile = self.account, self.account.profile
+        changes = []
+        old_role, old_active = profile.role, account.is_active
+        account.first_name = self.cleaned_data["first_name"]
+        account.last_name = self.cleaned_data["last_name"]
+        account.email = self.cleaned_data["email"]
+        account.is_active = self.cleaned_data["is_active"]
+        account.save(update_fields=["first_name", "last_name", "email", "is_active"])
+        profile.contact_number = self.cleaned_data["contact_number"]
+        profile.role = self.cleaned_data["role"]
+        profile.save(update_fields=["contact_number", "role"])
+        if old_role != profile.role:
+            changes.append(f"role {old_role} → {profile.role}")
+        if old_active != account.is_active:
+            changes.append("activated" if account.is_active else "deactivated")
+        return changes
+
+
+class ModeratorDecisionForm(forms.Form):
+    action = forms.ChoiceField(choices=[
+        ("request", "Select for moderator verification"),
+        ("approve", "Approve (Verified)"),
+        ("reject", "Reject"),
+        ("revoke", "Revoke authorization"),
+    ])
+    remarks = forms.CharField(max_length=500, required=False, widget=forms.Textarea(attrs={"rows": 2, "maxlength": 500}))
 
 
 class SystemSettingsForm(forms.ModelForm):
@@ -377,15 +589,6 @@ class SystemSettingsForm(forms.ModelForm):
         if value is not None and value > 3650:
             raise ValidationError("Choose a value of 3650 days or less.")
         return value
-
-
-class AdminReviewForm(forms.Form):
-    action = forms.ChoiceField(choices=[
-        ("resolve", "Resolve with no account action"),
-        ("suspend", "Suspend reported account"),
-        ("restore", "Restore account"),
-    ])
-    admin_note = forms.CharField(max_length=1500, required=False, widget=forms.Textarea(attrs={"rows": 3}))
 
 
 class CloseReasonForm(forms.Form):

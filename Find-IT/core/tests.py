@@ -243,7 +243,7 @@ class AdminAccountManagementTests(AccountTestBase):
         for username in ["2026-1001", "guard.one", "admin.one"]:
             self.assertContains(response, username)
         response = self.client.get(reverse("staff-accounts"), {"role": "staff"})
-        self.assertEqual({u.username for u in response.context["accounts"]}, {"guard.one"})
+        self.assertEqual({u.username for u in response.context["page_obj"]}, {"guard.one"})
 
     def test_admin_suspends_and_activates_staff(self):
         self.client.force_login(self.admin)
@@ -265,9 +265,12 @@ class AdminAccountManagementTests(AccountTestBase):
         self.assertEqual(response.status_code, 302)
         self.assertIn(reverse("login"), response["Location"])
 
-    def test_status_endpoint_only_changes_staff(self):
+    def test_status_endpoint_refuses_self_and_superusers(self):
+        # Since the admin-accounts update, administrators may deactivate students too,
+        # but never their own account or a Django superuser.
         self.client.force_login(self.admin)
-        for target in [self.student, self.admin]:
+        other_super = make_user("root.two", role=Profile.Role.ADMIN, superuser=True)
+        for target in [self.admin, other_super]:
             response = self.client.post(reverse("staff-account-status", args=[target.pk]), {"action": "suspend"})
             self.assertEqual(response.status_code, 403)
             target.refresh_from_db()
@@ -493,3 +496,483 @@ class CsrfProtectionTests(AccountTestBase):
             self.assertEqual(client.post(reverse(name), {}).status_code, 403, name)
         anon = self.client_class(enforce_csrf_checks=True)
         self.assertEqual(anon.post(reverse("signup"), self.signup_data()).status_code, 403)
+
+
+# ---------------------------------------------------------------------------
+# Admin accounts, moderator verification, chat safety and general reports
+# ---------------------------------------------------------------------------
+from django.utils import timezone
+
+from .consumers import _staff_user
+from .models import (
+    AbuseReport, ChatMessage, Conversation, GeneralReport, ModeratorVerification, ModeratorVerificationEvent,
+    ReportStatus, ReportStatusEvent,
+)
+from .permissions import can_review_reports, is_verified_moderator
+from .services import change_moderator_verification
+
+
+class ModerationTestBase(AccountTestBase):
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.moderator = make_user("mod.one", role=Profile.Role.STAFF, email="mod@example.com", first_name="Mona")
+        change_moderator_verification(cls.moderator, cls.admin, "request")
+        change_moderator_verification(cls.moderator, cls.admin, "approve", "Trusted guard.")
+        cls.post = ItemPost.objects.create(
+            author=cls.student, post_type=ItemPost.Type.LOST, title="Grey backpack", description="Plain grey backpack.",
+        )
+        cls.conversation = Conversation.objects.create(
+            post=cls.post, initiator=cls.other_student, recipient=cls.student,
+        )
+        cls.bad_message = ChatMessage.objects.create(
+            conversation=cls.conversation, sender=cls.other_student, text="Send me money first or else.",
+        )
+        ChatMessage.objects.create(conversation=cls.conversation, sender=cls.student, text="No thanks.")
+
+    def report_chat(self, client=None, **overrides):
+        data = {
+            "reason": "SCAM", "target_user": self.other_student.pk, "reported_message": self.bad_message.pk,
+            "details": "They asked for money before returning my bag.",
+        }
+        data.update(overrides)
+        return (client or self.client).post(reverse("report-chat", args=[self.conversation.pk]), data)
+
+
+class AdminAccountEditTests(ModerationTestBase):
+    def edit_data(self, account, **overrides):
+        data = {
+            "first_name": account.first_name or "Name", "last_name": account.last_name, "email": account.email,
+            "contact_number": "", "role": account.profile.role, "is_active": "1" if account.is_active else "0",
+        }
+        data.update(overrides)
+        return data
+
+    def test_admin_edits_account_details_and_role(self):
+        self.client.force_login(self.admin)
+        url = reverse("edit-account", args=[self.staff.pk])
+        self.assertEqual(self.client.get(url).status_code, 200)
+        response = self.client.post(url, self.edit_data(self.staff, first_name="Regina", role="admin"), follow=True)
+        self.assertContains(response, "was updated")
+        self.staff.refresh_from_db()
+        self.assertEqual(self.staff.first_name, "Regina")
+        self.assertEqual(self.staff.profile.role, Profile.Role.ADMIN)
+        self.assertTrue(StaffAuditLog.objects.filter(action="edited_account", target_id=str(self.staff.pk)).exists())
+
+    def test_admin_deactivates_and_activates_student(self):
+        self.client.force_login(self.admin)
+        self.client.post(reverse("staff-account-status", args=[self.student.pk]), {"action": "suspend"})
+        self.student.refresh_from_db()
+        self.assertFalse(self.student.is_active)
+        self.client.post(reverse("staff-account-status", args=[self.student.pk]), {"action": "activate"})
+        self.student.refresh_from_db()
+        self.assertTrue(self.student.is_active)
+
+    def test_staff_without_student_id_cannot_become_student(self):
+        self.client.force_login(self.admin)
+        response = self.client.post(reverse("edit-account", args=[self.staff.pk]), self.edit_data(self.staff, role="student"))
+        self.assertIn("role", response.context["form"].errors)
+
+    def test_admin_cannot_change_own_role_or_status(self):
+        self.client.force_login(self.admin)
+        self.client.post(reverse("edit-account", args=[self.admin.pk]), self.edit_data(self.admin, role="student", is_active="0"))
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+        self.assertTrue(self.admin.is_superuser)
+
+    def test_last_active_admin_protected(self):
+        lone_admin = make_user("admin.two", role=Profile.Role.ADMIN, first_name="Second")
+        self.admin.is_active = False
+        self.admin.save()
+        helper = make_user("admin.three", role=Profile.Role.ADMIN, first_name="Third")
+        self.client.force_login(helper)
+        # helper and lone_admin are both active admins: demoting one is fine.
+        self.client.post(reverse("edit-account", args=[lone_admin.pk]), self.edit_data(lone_admin, role="staff"))
+        lone_admin.refresh_from_db()
+        self.assertEqual(lone_admin.profile.role, Profile.Role.STAFF)
+        # Now helper is the only active admin; another admin cannot exist to demote them, and self-edit is locked.
+        response = self.client.post(reverse("staff-account-status", args=[helper.pk]), {"action": "suspend"})
+        self.assertEqual(response.status_code, 403)
+
+    def test_role_change_away_from_staff_revokes_moderator(self):
+        self.client.force_login(self.admin)
+        self.client.post(reverse("edit-account", args=[self.moderator.pk]), self.edit_data(self.moderator, role="admin"))
+        verification = ModeratorVerification.objects.get(staff=self.moderator)
+        self.assertEqual(verification.status, ModeratorVerification.Status.REVOKED)
+        self.assertTrue(verification.events.filter(new_status="REVOKED").exists())
+
+    def test_staff_and_students_cannot_edit_accounts_or_assign_roles(self):
+        for actor in [self.staff, self.moderator, self.student]:
+            self.client.force_login(actor)
+            url = reverse("edit-account", args=[actor.pk])
+            self.assertEqual(self.client.get(url).status_code, 403)
+            self.client.post(url, {"first_name": "X", "role": "admin", "is_active": "1"})
+            actor.refresh_from_db()
+            self.assertNotEqual(actor.profile.role, Profile.Role.ADMIN)
+            self.assertEqual(self.client.get(reverse("admin-dashboard")).status_code, 403)
+
+    def test_account_search_and_status_filter(self):
+        self.client.force_login(self.admin)
+        response = self.client.get(reverse("staff-accounts"), {"q": "mod@example"})
+        self.assertEqual([u.username for u in response.context["page_obj"]], ["mod.one"])
+        self.student.is_active = False
+        self.student.save()
+        response = self.client.get(reverse("staff-accounts"), {"status": "inactive"})
+        self.assertEqual([u.username for u in response.context["page_obj"]], ["2026-1001"])
+
+
+class ModeratorVerificationTests(ModerationTestBase):
+    def decide(self, staff, action, remarks=""):
+        return self.client.post(reverse("moderator-verification-action", args=[staff.pk]), {"action": action, "remarks": remarks})
+
+    def test_admin_requests_and_approves(self):
+        self.client.force_login(self.admin)
+        self.decide(self.staff, "request")
+        verification = ModeratorVerification.objects.get(staff=self.staff)
+        self.assertEqual(verification.status, ModeratorVerification.Status.PENDING)
+        self.assertFalse(is_verified_moderator(self.staff))
+        self.decide(self.staff, "approve", "Approved by security office.")
+        verification.refresh_from_db()
+        self.assertEqual(verification.status, ModeratorVerification.Status.VERIFIED)
+        self.assertEqual(verification.reviewed_by, self.admin)
+        self.assertIsNotNone(verification.decided_at)
+        self.assertEqual(verification.remarks, "Approved by security office.")
+        self.assertTrue(is_verified_moderator(self.staff))
+
+    def test_admin_rejects(self):
+        self.client.force_login(self.admin)
+        self.decide(self.staff, "request")
+        self.decide(self.staff, "reject", "Not on duty roster.")
+        self.assertEqual(ModeratorVerification.objects.get(staff=self.staff).status, ModeratorVerification.Status.REJECTED)
+        self.assertFalse(can_review_reports(self.staff))
+
+    def test_admin_revokes(self):
+        self.client.force_login(self.admin)
+        self.decide(self.moderator, "revoke", "Left the office.")
+        self.assertEqual(ModeratorVerification.objects.get(staff=self.moderator).status, ModeratorVerification.Status.REVOKED)
+        self.assertFalse(can_review_reports(self.moderator))
+
+    def test_invalid_transitions_refused(self):
+        self.client.force_login(self.admin)
+        response = self.decide(self.staff, "approve")  # never requested
+        self.assertFalse(ModeratorVerification.objects.filter(staff=self.staff).exists())
+        self.assertContains(self.client.get(reverse("moderator-verifications")), "Moderator verification")
+        self.decide(self.moderator, "reject")  # already verified
+        self.assertEqual(ModeratorVerification.objects.get(staff=self.moderator).status, ModeratorVerification.Status.VERIFIED)
+
+    def test_only_staff_can_be_moderators(self):
+        self.client.force_login(self.admin)
+        self.decide(self.student, "request")
+        self.assertFalse(ModeratorVerification.objects.filter(staff=self.student).exists())
+
+    def test_history_is_recorded_and_shown(self):
+        self.client.force_login(self.admin)
+        self.decide(self.staff, "request")
+        self.decide(self.staff, "reject", "Try again next term.")
+        self.decide(self.staff, "request")
+        events = ModeratorVerificationEvent.objects.filter(verification__staff=self.staff)
+        self.assertEqual(events.count(), 3)
+        response = self.client.get(reverse("moderator-verifications"))
+        self.assertContains(response, "Try again next term.")
+
+    def test_non_admins_cannot_manage_verifications(self):
+        for actor in [self.staff, self.moderator, self.student]:
+            self.client.force_login(actor)
+            self.assertEqual(self.client.get(reverse("moderator-verifications")).status_code, 403)
+            self.assertEqual(self.decide(actor, "request").status_code, 403)
+        self.assertFalse(ModeratorVerification.objects.filter(staff=self.staff).exists())
+
+    def test_pending_rejected_revoked_staff_have_no_moderator_access(self):
+        report = AbuseReport.objects.create(reporter=self.student, conversation=self.conversation, target_user=self.other_student, reason="SPAM", details="Spam messages here.")
+        for status in ["PENDING", "REJECTED", "REVOKED", None]:
+            ModeratorVerification.objects.filter(staff=self.staff).delete()
+            if status:
+                ModeratorVerification.objects.create(staff=self.staff, status=status)
+            self.client.force_login(self.staff)
+            for url in [reverse("admin-reports"), reverse("general-reports"), reverse("review-report", args=[report.pk]),
+                        reverse("chat-room", args=[self.conversation.pk])]:
+                self.assertEqual(self.client.get(url).status_code, 403, f"{status} {url}")
+            self.assertFalse(_staff_user(self.staff))
+            response = self.client.post(reverse("pause-chat", args=[self.conversation.pk]))
+            self.assertEqual(response.status_code, 403)
+
+    def test_verified_moderator_has_access(self):
+        self.client.force_login(self.moderator)
+        for url in [reverse("admin-reports"), reverse("general-reports"), reverse("chat-room", args=[self.conversation.pk])]:
+            self.assertEqual(self.client.get(url).status_code, 200, url)
+        self.assertTrue(_staff_user(self.moderator))
+
+    def test_deactivated_moderator_loses_access(self):
+        self.moderator.is_active = False
+        self.moderator.save()
+        self.assertFalse(is_verified_moderator(self.moderator))
+
+
+class ChatSafetyReportTests(ModerationTestBase):
+    def test_participant_submits_report(self):
+        self.client.force_login(self.student)
+        self.assertEqual(self.client.get(reverse("report-chat", args=[self.conversation.pk])).status_code, 200)
+        response = self.report_chat()
+        report = AbuseReport.objects.get()
+        self.assertRedirects(response, reverse("chat-room", args=[self.conversation.pk]))
+        self.assertRegex(report.reference, r"^CSR-\d{8}-[0-9A-F]{6}$")
+        self.assertEqual(report.status, ReportStatus.SUBMITTED)
+        self.assertEqual((report.reporter, report.target_user, report.reported_message), (self.student, self.other_student, self.bad_message))
+        self.assertEqual(report.events.count(), 1)
+        # Not automatic: no suspension, chat not paused by a participant report.
+        self.other_student.refresh_from_db()
+        self.conversation.refresh_from_db()
+        self.assertTrue(self.other_student.is_active)
+        self.assertFalse(self.conversation.is_paused)
+
+    def test_report_validation(self):
+        self.client.force_login(self.student)
+        response = self.report_chat(target_user=self.student.pk, details="short", reason="")
+        self.assertEqual(set(response.context["form"].errors), {"target_user", "details", "reason"})
+        stranger_message = ChatMessage.objects.create(
+            conversation=Conversation.objects.create(post=self.post, initiator=self.staff, recipient=self.student),
+            sender=self.staff, text="Elsewhere",
+        )
+        response = self.report_chat(reported_message=stranger_message.pk)
+        self.assertIn("reported_message", response.context["form"].errors)
+        self.assertFalse(AbuseReport.objects.exists())
+
+    def test_non_participant_cannot_report_or_view(self):
+        outsider = make_user("2026-1003", email="out@example.com")
+        self.client.force_login(outsider)
+        self.assertEqual(self.report_chat().status_code, 403)
+        self.assertEqual(self.client.get(reverse("chat-room", args=[self.conversation.pk])).status_code, 403)
+
+    def test_reviewer_status_flow_and_history(self):
+        self.client.force_login(self.student)
+        self.report_chat()
+        report = AbuseReport.objects.get()
+        self.client.force_login(self.moderator)
+        url = reverse("review-report", args=[report.pk])
+        response = self.client.get(url)
+        self.assertContains(response, "Send me money first")
+        self.client.post(url, {"action": "UNDER_REVIEW", "remarks": "Checking messages."})
+        report.refresh_from_db()
+        self.assertEqual(report.status, ReportStatus.UNDER_REVIEW)
+        self.assertEqual(report.assigned_reviewer, self.moderator)
+        self.client.post(url, {"action": "RESOLVED", "remarks": "Warned the user."})
+        report.refresh_from_db()
+        self.assertEqual(report.status, ReportStatus.RESOLVED)
+        self.assertEqual(report.reviewed_by, self.moderator)
+        self.assertIsNotNone(report.resolved_at)
+        self.assertEqual(report.admin_note, "Warned the user.")
+        self.assertEqual(
+            list(report.events.values_list("new_status", flat=True)),
+            ["SUBMITTED", "UNDER_REVIEW", "RESOLVED"],
+        )
+        # Closed reports cannot be resolved again without reopening.
+        response = self.client.post(url, {"action": "DISMISSED"})
+        self.assertIn("action", response.context["form"].errors)
+
+    def test_dismiss_and_filters(self):
+        r1 = AbuseReport.objects.create(reporter=self.student, conversation=self.conversation, target_user=self.other_student, reason="SPAM", details="Spam spam spam.")
+        AbuseReport.objects.create(reporter=self.other_student, conversation=self.conversation, target_user=self.student, reason="HARASSMENT", details="Rude replies here.")
+        self.client.force_login(self.admin)
+        self.client.post(reverse("review-report", args=[r1.pk]), {"action": "DISMISSED", "remarks": "Not spam."})
+        list_url = reverse("admin-reports")
+        self.assertEqual(len(self.client.get(list_url, {"status": "DISMISSED"}).context["page_obj"]), 1)
+        self.assertEqual(len(self.client.get(list_url, {"category": "HARASSMENT"}).context["page_obj"]), 1)
+        self.assertEqual(len(self.client.get(list_url, {"q": r1.reference}).context["page_obj"]), 1)
+        today = timezone.localdate().isoformat()
+        self.assertEqual(len(self.client.get(list_url, {"date_from": today, "date_to": today}).context["page_obj"]), 2)
+        self.assertEqual(len(self.client.get(list_url, {"date_to": "2000-01-01"}).context["page_obj"]), 0)
+
+    def test_only_admin_can_suspend_from_report(self):
+        report = AbuseReport.objects.create(reporter=self.student, conversation=self.conversation, target_user=self.other_student, reason="THREATS", details="Threatening messages.")
+        self.client.force_login(self.moderator)
+        url = reverse("review-report", args=[report.pk])
+        self.client.post(url, {"action": "RESOLVED", "account_action": "suspend"})
+        self.other_student.refresh_from_db()
+        self.assertTrue(self.other_student.is_active, "Moderators cannot suspend accounts.")
+        report.status = ReportStatus.UNDER_REVIEW
+        report.save()
+        self.client.force_login(self.admin)
+        self.client.post(url, {"action": "RESOLVED", "account_action": "suspend", "remarks": "Confirmed threats."})
+        self.other_student.refresh_from_db()
+        self.assertFalse(self.other_student.is_active)
+
+    def test_reports_private_and_remarks_internal(self):
+        self.client.force_login(self.student)
+        self.report_chat()
+        report = AbuseReport.objects.get()
+        report.admin_note = "INTERNAL-ONLY-NOTE"
+        report.save()
+        response = self.client.get(reverse("my-reports"))
+        self.assertContains(response, report.reference)
+        self.assertNotContains(response, "INTERNAL-ONLY-NOTE")
+        self.client.force_login(self.other_student)
+        self.assertNotContains(self.client.get(reverse("my-reports")), report.reference)
+        for user in [self.student, self.other_student, self.staff]:
+            self.client.force_login(user)
+            self.assertEqual(self.client.get(reverse("review-report", args=[report.pk])).status_code, 403)
+            self.assertEqual(self.client.get(reverse("admin-reports")).status_code, 403)
+
+    def test_existing_reports_migrated_fields(self):
+        report = AbuseReport.objects.create(reporter=self.student, reason="OTHER", details="Something else.")
+        self.assertTrue(report.reference.startswith("CSR-"))
+        self.assertEqual(report.status, ReportStatus.SUBMITTED)
+
+
+@override_settings(PRIVATE_MEDIA_ROOT=TEMP_MEDIA + "/private")
+class GeneralReportTests(ModerationTestBase):
+    def submit(self, **overrides):
+        data = {"category": "SUSPICIOUS_LISTING", "description": "This listing looks fake to me.", "post": self.post.pk}
+        data.update(overrides)
+        return self.client.post(reverse("general-report-create"), data)
+
+    def test_submit_with_listing_and_attachment(self):
+        self.client.force_login(self.other_student)
+        page = self.client.get(reverse("general-report-create"), {"post": self.post.pk})
+        self.assertContains(page, "Grey backpack")
+        response = self.submit(attachment=make_image("screen.png"))
+        self.assertRedirects(response, reverse("my-reports"))
+        report = GeneralReport.objects.get()
+        self.assertRegex(report.reference, r"^GRP-\d{8}-[0-9A-F]{6}$")
+        self.assertEqual((report.reporter, report.post, report.status), (self.other_student, self.post, ReportStatus.SUBMITTED))
+        self.assertTrue(report.attachment.name.startswith("report-attachments/"))
+        self.assertNotIn("screen", report.attachment.name)
+        # Stored outside public media.
+        self.assertFalse(report.attachment.path.startswith(str(TEMP_MEDIA) + "/report-attachments"))
+        self.post.refresh_from_db()
+        self.assertFalse(self.post.is_archived, "Reported listings are not hidden automatically.")
+        self.assertEqual(self.post.status, ItemPost.Status.OPEN)
+
+    def test_technical_report_without_listing(self):
+        self.client.force_login(self.student)
+        self.submit(category="TECHNICAL", post="", description="Upload button does nothing on my phone.")
+        self.assertIsNone(GeneralReport.objects.get().post)
+
+    def test_attachment_validation(self):
+        self.client.force_login(self.student)
+        bad = SimpleUploadedFile("evil.png", b"<script>alert(1)</script>", content_type="image/png")
+        self.assertIn("attachment", self.submit(attachment=bad).context["form"].errors)
+        exe = SimpleUploadedFile("tool.exe", b"MZ....", content_type="application/octet-stream")
+        self.assertIn("attachment", self.submit(attachment=exe).context["form"].errors)
+        pdf = SimpleUploadedFile("proof.pdf", b"%PDF-1.4\n%%EOF", content_type="application/pdf")
+        self.assertRedirects(self.submit(attachment=pdf), reverse("my-reports"))
+        self.assertIn("description", self.submit(description="short").context["form"].errors)
+
+    def test_attachment_access_control(self):
+        self.client.force_login(self.other_student)
+        self.submit(attachment=make_image("screen.png"))
+        report = GeneralReport.objects.get()
+        url = reverse("general-report-attachment", args=[report.pk])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["X-Content-Type-Options"], "nosniff")
+        b"".join(response.streaming_content)
+        for user in [self.student, self.staff]:
+            self.client.force_login(user)
+            self.assertEqual(self.client.get(url).status_code, 403)
+        for user in [self.moderator, self.admin]:
+            self.client.force_login(user)
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200)
+            b"".join(response.streaming_content)
+        self.client.logout()
+        self.assertEqual(self.client.get(url).status_code, 302)
+        self.assertEqual(self.client.get(f"/media/{report.attachment.name}").status_code, 404)
+
+    def test_reviewer_reviews_with_related_item_and_history(self):
+        self.client.force_login(self.other_student)
+        self.submit()
+        report = GeneralReport.objects.get()
+        self.client.force_login(self.moderator)
+        url = reverse("general-report-detail", args=[report.pk])
+        response = self.client.get(url)
+        self.assertContains(response, "Grey backpack")
+        self.assertContains(response, self.student.username)
+        self.client.post(url, {"action": "UNDER_REVIEW"})
+        self.client.post(url, {"action": "NOTE", "remarks": "Asked author for details."})
+        self.client.post(url, {"action": "RESOLVED", "remarks": "Listing corrected."})
+        report.refresh_from_db()
+        self.assertEqual(report.status, ReportStatus.RESOLVED)
+        self.assertEqual(report.internal_remarks, "Listing corrected.")
+        self.assertEqual(report.reviewed_by, self.moderator)
+        self.assertEqual(
+            list(report.events.values_list("new_status", "note")),
+            [("SUBMITTED", ""), ("UNDER_REVIEW", ""), ("UNDER_REVIEW", "Asked author for details."), ("RESOLVED", "Listing corrected.")],
+        )
+        self.client.force_login(self.other_student)
+        self.assertNotContains(self.client.get(reverse("my-reports")), "Listing corrected.")
+
+    def test_unauthorized_cannot_review(self):
+        self.client.force_login(self.other_student)
+        self.submit()
+        report = GeneralReport.objects.get()
+        for user in [self.student, self.other_student, self.staff]:
+            self.client.force_login(user)
+            self.assertEqual(self.client.get(reverse("general-report-detail", args=[report.pk])).status_code, 403)
+            self.client.post(reverse("general-report-detail", args=[report.pk]), {"action": "DISMISSED"})
+        report.refresh_from_db()
+        self.assertEqual(report.status, ReportStatus.SUBMITTED)
+
+    def test_report_event_constraint(self):
+        from django.db import IntegrityError, transaction as db_transaction
+        with self.assertRaises(IntegrityError), db_transaction.atomic():
+            ReportStatusEvent.objects.create(new_status="SUBMITTED")
+
+
+class AdminDashboardTests(ModerationTestBase):
+    def test_counts_match_database_and_update(self):
+        self.client.force_login(self.admin)
+        response = self.client.get(reverse("admin-dashboard"))
+        c = response.context
+        self.assertEqual(c["account_counts"]["total"], User.objects.count())
+        self.assertEqual(c["account_counts"]["students"], 2)
+        self.assertEqual(c["account_counts"]["staff"], 2)
+        self.assertEqual(c["account_counts"]["admins"], 1)
+        self.assertEqual(c["account_counts"]["inactive"], 0)
+        self.assertEqual(c["verification_counts"]["VERIFIED"], 1)
+        self.assertEqual(c["chat_counts"]["TOTAL"], 0)
+        self.assertEqual(c["general_counts"]["TOTAL"], 0)
+
+        self.client.force_login(self.student)
+        self.report_chat()
+        self.client.post(reverse("general-report-create"), {"category": "TECHNICAL", "description": "Search is slow today."})
+        self.client.force_login(self.admin)
+        self.client.post(reverse("staff-account-status", args=[self.other_student.pk]), {"action": "suspend"})
+        report = AbuseReport.objects.get()
+        self.client.post(reverse("review-report", args=[report.pk]), {"action": "UNDER_REVIEW"})
+        c = self.client.get(reverse("admin-dashboard")).context
+        self.assertEqual(c["chat_counts"]["TOTAL"], 1)
+        self.assertEqual(c["chat_counts"]["UNDER_REVIEW"], 1)
+        self.assertEqual(c["chat_counts"]["SUBMITTED"], 0)
+        self.assertEqual(c["general_counts"]["SUBMITTED"], 1)
+        self.assertEqual(c["account_counts"]["inactive"], 1)
+
+    def test_dashboard_admin_only(self):
+        for user in [self.student, self.staff, self.moderator]:
+            self.client.force_login(user)
+            self.assertEqual(self.client.get(reverse("admin-dashboard")).status_code, 403)
+
+    def test_staff_workspace_still_works(self):
+        for user, sees_reports in [(self.staff, False), (self.moderator, True), (self.admin, True)]:
+            self.client.force_login(user)
+            response = self.client.get(reverse("staff-dashboard"))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.context["is_reviewer"], sees_reports)
+
+
+class ExistingFeatureSmokeTests(ModerationTestBase):
+    def test_core_pages_still_render(self):
+        self.client.force_login(self.student)
+        for name, args in [("home", []), ("post-detail", [self.post.pk]), ("create-post", []), ("my-posts", []),
+                           ("my-claims", []), ("messages", []), ("notifications", []), ("my-profile", []), ("my-reports", []),
+                           ("chat-room", [self.conversation.pk])]:
+            self.assertEqual(self.client.get(reverse(name, args=args)).status_code, 200, name)
+        self.client.force_login(self.admin)
+        for name in ["admin-dashboard", "staff-accounts", "moderator-verifications", "admin-reports", "general-reports",
+                     "admin-settings", "staff-dashboard"]:
+            self.assertEqual(self.client.get(reverse(name)).status_code, 200, name)
+        self.assertEqual(self.client.get(reverse("edit-account", args=[self.student.pk])).status_code, 200)
+
+    def test_post_detail_has_report_link(self):
+        self.client.force_login(self.other_student)
+        response = self.client.get(reverse("post-detail", args=[self.post.pk]))
+        self.assertContains(response, f"{reverse('general-report-create')}?post={self.post.pk}")

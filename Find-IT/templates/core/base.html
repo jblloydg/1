@@ -24,7 +24,7 @@
       <a href="{% url 'messages' %}">Messages</a>
       <a href="{% url 'notifications' %}" class="nav-notice">Updates{% if unread_notification_count %}<span class="notice-count">{{ unread_notification_count }}</span>{% endif %}</a>
       {% if current_role == "staff" or current_role == "admin" %}<a href="{% url 'staff-dashboard' %}">Staff</a>{% endif %}
-      {% if current_role == "admin" %}<a href="{% url 'admin-settings' %}">Admin</a>{% endif %}
+      {% if current_role == "admin" %}<a href="{% url 'admin-dashboard' %}">Admin</a>{% endif %}
       <a href="{% url 'my-profile' %}">My profile</a>
     </nav>
     <div class="user-menu">
@@ -35,11 +35,13 @@
           <span class="profile-caret" aria-hidden="true">▾</span>
         </summary>
         <div class="profile-dropdown" role="menu">
-          <div class="profile-dropdown-head"><strong>{{ user.get_full_name|default:user.username }}</strong><small>{{ current_role_label }} · {{ user.username }}</small></div>
+          <div class="profile-dropdown-head"><strong>{% firstof user.get_full_name user.username %}</strong><small>{{ current_role_label }} · {{ user.username }}</small></div>
           <a role="menuitem" href="{% url 'my-profile' %}">My profile</a>
           <a role="menuitem" href="{% url 'edit-profile' %}">Edit profile</a>
           <a role="menuitem" href="{% url 'change-password' %}">Change password</a>
-          {% if current_role == "admin" %}<a role="menuitem" href="{% url 'staff-accounts' %}">Staff accounts</a>{% endif %}
+          <a role="menuitem" href="{% url 'my-reports' %}">My reports</a>
+          <a role="menuitem" href="{% url 'general-report-create' %}">Report a problem</a>
+          {% if current_role == "admin" %}<a role="menuitem" href="{% url 'admin-dashboard' %}">Admin dashboard</a>{% endif %}
           <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="link-button" role="menuitem" type="submit">Log out</button></form>
         </div>
       </details>

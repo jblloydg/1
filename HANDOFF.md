@@ -1,10 +1,244 @@
-# Find-IT Handoff — Account management and user profile
+# Find-IT Handoff — Admin accounts, moderator verification, and reports
 
-> Newest work is first. The earlier handoff for the **item category and location** feature is kept unchanged at the bottom of this file.
+> Newest work is first. Earlier handoffs (account management and profile; item category and location) are kept below.
 
-## 1. Feature completed
+## 1. Features completed
 
-### Module 1 — Registration, login, and role assignment
+### Assessment before coding
+
+| Requirement | Before | What was done |
+| --- | --- | --- |
+| Accounts and roles | Partial: 3 roles, student signup, admin creates staff | Added **Edit account** (name, email, contact, role, active/inactive) for any account, deactivate/activate for any account, account search and filters, and pagination |
+| Moderator verification | Missing | New `ModeratorVerification` model plus a history table |
+| Chat safety reports | Partial: `AbuseReport`, staff-only, statuses Pending/Action taken/Resolved | **Extended `AbuseReport` in place**, so no duplicate model was created. Existing reports are migrated without losing data |
+| General reports | Missing | New `GeneralReport` model with private attachments |
+| Status tracking | Partial | Shared statuses, `ReportStatusEvent` history, and a **My reports** page |
+| Admin dashboard | Partial: no counts | New **Admin dashboard** with sections A–D, all counted live from the database |
+
+### 1. User accounts and roles
+
+- There are still only **Student, Staff, and Admin**. No Teacher role was added; teachers use Staff.
+- **Accounts page** (`/staff/accounts/`, administrators only)
+  - Create staff accounts.
+  - Search by name, Student ID, username, or email, and filter by role and by active/inactive. Results are paginated.
+  - Each row has **Edit** and **Activate/Deactivate**.
+- **Edit account** (`/staff/accounts/<id>/edit/`) lets an administrator change name, email, contact number, **role**, and **status**. Every save is written to the staff audit log. Safety rules:
+  - An administrator cannot change their **own** role or status.
+  - Django superusers can only be changed in Django administration.
+  - At least **one active administrator** must remain.
+  - An account can become **Student** only if it has a Student ID.
+  - Changing a Staff account to another role **automatically revokes** its moderator authorization.
+- Students still cannot pick a role at sign-up, and staff and students get *403 Forbidden* on every admin page and action. All checks happen in the Django views.
+
+### 2. Staff moderator verification
+
+- **Moderator verification page** (`/staff/moderators/`, administrators only)
+  - Lists every Staff account with its current status: **Not requested, Pending, Verified, Rejected, or Revoked**.
+  - Status cards at the top double as filters.
+  - Actions:
+    - **Select for verification** moves Not requested, Rejected, or Revoked to Pending.
+    - **Approve** or **Reject** a Pending request.
+    - **Revoke** a Verified moderator.
+  - Each decision can carry optional remarks.
+- Each verification stores the staff account, status, who requested it and when, the administrator who decided and when, and the remarks.
+- **Verification history** lists every change, with pagination.
+- Only **Verified, active Staff** get moderator permissions. Pending, Rejected, Revoked, and never-requested staff get none.
+- The page states that this is an authorization inside Find-IT only. It **does not** claim to verify university employment.
+
+**Permission change you should know about.** Before, *any* Staff account could read anyone's private chat and pause chats. To meet "do not expose private conversations to unauthorized users", these actions are now limited to **administrators and verified moderators**:
+
+- reading other people's chats, including the live WebSocket view
+- pausing chats
+- reviewing reports
+
+Other Staff work is unchanged: guard-house custody, post actions, comment moderation, and the staff workspace.
+
+### 3. Chat safety reports
+
+- In any conversation, a participant can click **⚑ Report this conversation**. Authorized reviewers can also file a report.
+- The report records:
+  - a unique reference, such as `CSR-20261127-4F9A2C`
+  - the reporter and the reported user
+  - the conversation and, optionally, the specific message
+  - the category and description
+  - when it was submitted, the assigned reviewer, and the status
+- Categories: Harassment or bullying, Threats or intimidation, Scam or suspicious behavior, Inappropriate messages, Spam, Other.
+- **Review queue** (`/staff/reports/`, administrators and verified moderators): filter by category, status, and date range, and search by reference, name, or description. Results are paginated.
+- **Report detail** shows the reported message highlighted with the messages around it, a link to the full conversation, and the full review history. A reviewer can:
+  - mark the report **Under Review**, which assigns it to them
+  - **Resolve** or **Dismiss** it
+  - add **internal remarks** at any time
+- Reviewer, review time, and resolution time are saved.
+- **Nothing is automatic.** A report never suspends anyone, and a participant's report doesn't pause the chat. Only an **administrator** can record *suspend* or *restore* account, and only while resolving a report. Moderators cannot suspend accounts, which matches the original rule that staff can't ban.
+
+### 4. General item and system reports (separate from chat reports)
+
+- Users submit one from **⚑ Report this listing** on a post, or from **Report a problem** in the profile dropdown (`/reports/new/`).
+- Each report has its own reference, such as `GRP-…`, plus the reporter, category, optional related listing, description, an optional screenshot or PDF, when it was submitted, and its status.
+- Categories: Suspicious or fraudulent listing, Incorrect item information, Duplicate listing, Inappropriate content or image, Suspected scam, Technical or system issue, Other.
+- **Attachments are protected.**
+  - Only JPG, PNG, WebP, or PDF files up to 5 MB are accepted. The file's real contents are checked, not just its name.
+  - Files are saved under a random name in **`private_media/`**, outside the public `media/` folder.
+  - Files are served only through a checked view, and only to the reporter, administrators, and verified moderators. Responses use `nosniff`, `no-store`, and a sandboxing Content-Security-Policy.
+- **Review queue** (`/staff/general-reports/`) has the same search, filters, and pagination. **Report detail** shows the related listing (author, status, category, location, and a link), the attachment, the review form, and the history.
+- Reported listings are **never hidden or deleted automatically**. The reviewer uses the listing's existing actions if needed.
+
+### 5. Report status and tracking
+
+- Both report types use **Submitted, Under Review, Resolved, and Dismissed**.
+- Every change is stored in `ReportStatusEvent`, with the old and new status, who made it, when, and the internal note.
+- **My reports** (`/my-reports/`, in the profile dropdown) shows a user's own reports with reference, category, status, and dates. It **never** shows internal remarks or other people's reports.
+- Automatic deletion of archived posts now also keeps a post while a general report about it is still open.
+
+### 6. Admin dashboard (`/staff/admin/`, the **Admin** link in the navigation)
+
+- **A. User accounts:** total, students, staff, admins, active, inactive, plus a link to manage accounts.
+- **B. Moderator verification:** pending, verified, rejected, revoked, a waiting list, and recent history.
+- **C. Chat safety reports:** total, submitted, under review, resolved, dismissed, and open reports.
+- **D. General reports:** the same counts, and open reports.
+- Every number is counted from the database on each visit, and each card opens the matching filtered list.
+- The existing **Staff workspace** still works. For verified moderators and administrators it now shows open-report counts. Other staff see a notice explaining that moderator authorization is needed.
+
+## 2. Starting version
+
+- Repository `jblloydg/1`, branch `main`, starting commit **`af32f31`** ("Add account management and user profile to Find-IT").
+
+## 3. Files created or modified
+
+All paths are inside `Find-IT/`. Root files (`README.md`, `LICENSE`, `Find-IT-local-app.zip`) are unchanged.
+
+Modified:
+
+| File | Change |
+| --- | --- |
+| `core/models.py` | Shared `ReportStatus`; extended `AbuseReport`; new `GeneralReport`, `ReportStatusEvent`, `ModeratorVerification`, `ModeratorVerificationEvent`; `StaffAuditLog.action_label` |
+| `core/permissions.py` | `is_verified_moderator`, `can_review_reports`, `can_review_private_chats` |
+| `core/services.py` | `review_report_status`, `record_report_submission`, `change_moderator_verification`, `revoke_moderator_if_not_staff`; archive purge also respects open general reports |
+| `core/forms.py` | Chat `ReportForm` reworked; new `GeneralReportForm`, `ReportReviewForm`, `AdminAccountForm`, `ModeratorDecisionForm`; old `AdminReviewForm` removed (replaced) |
+| `core/views.py` | Accounts search, filters, and pagination; `edit_account`; `staff_account_status` now covers any account; `admin_dashboard`; moderator views; chat and general report views; protected attachment view; `my_reports`; chat review and pause limited to reviewers |
+| `core/urls.py` | New routes, listed below |
+| `core/consumers.py` | Live chat viewing by non-participants limited to administrators and verified moderators |
+| `core/validators.py` | `validate_report_attachment` |
+| `core/admin.py` | Read-only Django admin views for the new models; reference column for chat reports |
+| `core/tests.py` | 39 new tests (94 in total) |
+| `findit/settings.py` | `PRIVATE_MEDIA_ROOT` |
+| `.gitignore` | Ignores `private_media/` |
+| `static/css/app.css` | New styles added at the end |
+| `templates/core/base.html` | Admin link opens the dashboard; dropdown gets My reports, Report a problem, and Admin dashboard |
+| `templates/core/staff_accounts.html`, `admin_reports.html`, `staff_dashboard.html`, `chat_room.html` | Updated pages |
+| `templates/core/post_detail.html` | One added "Report this listing" link |
+| `templates/core/profile.html`, `includes/avatar.html` | Safer name display, no behaviour change |
+
+Created:
+
+- `core/migrations/0004_reports_and_moderator_verification.py`
+- Templates: `admin_dashboard.html`, `account_edit.html`, `moderator_verifications.html`, `chat_report_form.html`, `chat_report_detail.html`, `general_report_form.html`, `general_reports.html`, `general_report_detail.html`, `my_reports.html`
+- Includes: `includes/pagination.html`, `report_filters.html`, `report_status.html`, `report_history.html`, `review_form.html`, `report_count_cards.html`
+
+New URLs:
+
+- `/staff/admin/`
+- `/staff/accounts/<id>/edit/`
+- `/staff/moderators/` and `/staff/moderators/<id>/decide/`
+- `/staff/reports/<uuid>/`, the chat report detail, which replaces the old `…/review/` address
+- `/staff/general-reports/` and `/staff/general-reports/<uuid>/`
+- `/reports/new/` and `/reports/general/<uuid>/attachment/`
+- `/my-reports/`
+
+## 4. Database models and migrations
+
+Migration **`0004_reports_and_moderator_verification`**:
+
+- **`AbuseReport`** (chat safety reports), extended and not replaced:
+  - New fields: `reference` (unique), `reported_message`, `assigned_reviewer`, and `reviewed_at`.
+  - New statuses and categories.
+  - `admin_note` is now labelled *internal remarks*.
+  - The data step converts existing rows: Pending → Submitted, Action taken → Resolved, Resolved → Resolved, and the category "False claim or suspected fraud" → *Scam or suspicious behavior*. It also gives every old report a reference number.
+  - Tested forwards and backwards on a copy with old-style reports. Nothing was lost.
+- **`GeneralReport`**: reference, reporter, category, post (optional; kept as empty if the post is deleted), description, attachment (private storage), status, internal remarks, assigned reviewer, reviewed by and at, resolved at, and created at.
+- **`ReportStatusEvent`**: history for either report type. A database constraint makes sure each row belongs to exactly one report.
+- **`ModeratorVerification`**: one row per Staff account, holding status, requested by and at, reviewed by, decided at, and remarks.
+- **`ModeratorVerificationEvent`**: verification history.
+
+Everything uses standard Django fields and works on SQLite now and PostgreSQL later. Run `python manage.py migrate`.
+
+## 5. Set up and run on Windows PowerShell
+
+```powershell
+# 1. Get the newest code
+cd findit-repo            # your existing clone
+git pull
+cd Find-IT
+#    (New computer: git clone https://github.com/jblloydg/1.git findit-repo; cd findit-repo\Find-IT)
+
+# 2. Virtual environment (skip creating it if .venv already exists)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 3. Packages
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+# 4. Database update and demo accounts
+python manage.py migrate
+python manage.py seed_demo
+
+# 5. Run
+.\start_findit.ps1
+```
+
+If PowerShell blocks the script: `powershell -ExecutionPolicy Bypass -File .\start_findit.ps1`. Then open **http://127.0.0.1:8000/**.
+
+Run the tests with `python manage.py test core`.
+
+## 6. See the features working
+
+These are the public fictional demo logins: student `2026-0001` and `2026-0002` (password `DemoFindIt!2026`), staff `security.demo` (`DemoStaff!2026`), and admin `findit-admin` (`DemoAdmin!2026`).
+
+1. **Moderator not yet verified.** Sign in as `security.demo`. The Staff workspace says moderator authorization is required. Opening **/staff/reports/** gives *Forbidden*.
+2. **Verify a moderator.** In another browser or a private window, sign in as `findit-admin` and click **Admin** in the navigation.
+   - Under **B. Moderator verification**, click **Review verifications**.
+   - Click **Select for verification** on *Campus Staff*, then **Approve**, adding a remark.
+   - The status and history update, and the dashboard count changes.
+   - Refresh the staff window: report links and conversation review now appear.
+3. **Chat report.**
+   - As `2026-0002`, open the blue bottle listing and message the finder. As `2026-0001`, reply.
+   - As `2026-0001`, open the conversation, click **⚑ Report this conversation**, choose a category and the message, describe it, and submit. You get a `CSR-…` reference.
+   - **My reports** shows the report as *Submitted*.
+4. **Review it.** As the moderator or the admin, open **Chat reports**.
+   - Filter by status or category, then click **Review**.
+   - Mark it **Under Review**, then **Resolve** it with remarks.
+   - The history lists each step. The student's **My reports** shows *Resolved*, but not your remarks.
+   - As the admin you can also choose *Suspend the reported account* while resolving.
+5. **General report.** As `2026-0002`, open a listing and click **⚑ Report this listing**. Choose *Duplicate item listing*, describe it, attach a PNG screenshot, and submit. The listing stays visible. Then as the moderator open **General reports**, review it, and open the attachment.
+6. **Accounts.** As the admin, open **Admin → Manage accounts**.
+   - Search for `2026`, filter by role or inactive, and click **Edit** on a staff account.
+   - Change the role to Admin, or set it to Inactive.
+   - Your own account shows role and status as locked.
+7. **Revoke.** On **Moderator verification**, click **Revoke** for Campus Staff. That account loses access to reports and chats right away.
+
+## 7. Remaining limitations
+
+- **Moderator scope.** "Moderator-only functions" are taken to mean reviewing chat and general reports, reading or pausing other people's chats, and opening report attachments. If more functions should be moderator-only, they can be added to `can_review_reports`.
+- **No email or in-app notification** is sent when a report status changes or a moderator is approved. Users check **My reports**. The existing notification model is tied to a listing, so it was not reused for this.
+- **Unique email** is still enforced by the forms, not the database (see the earlier handoff).
+- **Django superusers** have to be edited in Django administration, not on the Find-IT accounts page.
+- **Admin reopen.** A Resolved or Dismissed report can be set back to *Under Review* by a reviewer. There is no separate approval step for reopening.
+- **Hosting.** `private_media/` must be on durable private storage when hosted, and must **not** be served publicly by the web server.
+- **Testing:** done with Python 3.13 and Django 5.2.19 on Linux.
+  - `manage.py check` and `makemigrations --check` are clean, and **94 of 94** tests pass.
+  - The migration was run forwards and backwards on old-style data.
+  - The dashboard, accounts, moderator, report list, report detail, report forms, My reports, and chat pages were checked in a real browser on desktop and phone.
+  - It was not run on Windows itself.
+- **Nothing private is committed:** no `db.sqlite3`, `media/`, `private_media/`, `.env`, secret keys, or real student data.
+
+---
+
+## Earlier handoff — Account management and user profile (commit af32f31)
+
+### 1. Feature completed
+
+#### Module 1 — Registration, login, and role assignment
 
 - **Student registration** (`/signup/`) asks for first name, last name, Student ID, email address, password, and confirm password.
   - Every field is required and checked.
@@ -36,7 +270,7 @@
   - Activate/suspend accepts POST only.
   - All forms are protected with CSRF.
 
-### Module 2 — View and edit user profile
+#### Module 2 — View and edit user profile
 
 - **My profile** (`/profile/`) shows the profile picture (or an initial), full name, Student ID or username, email, contact number, role, registration date, and account status.
 - **Edit profile** (`/profile/edit/`)
@@ -59,12 +293,12 @@
   - A **profile dropdown** sits at the upper right: avatar and name, then My profile, Edit profile, Change password, Staff accounts (administrators only), and Log out.
   - All new pages reuse the existing Find-IT colours, cards, buttons, and fonts, and work on phone screens.
 
-## 2. Starting version
+### 2. Starting version
 
 - Repository: `jblloydg/1`, branch `main`
 - Starting commit: **`c54da44`**, "Add item category and location filters to Find-IT". That commit was itself built on the original **`9f0b2ad`**.
 
-## 3. Files changed
+### 3. Files changed
 
 All paths are inside `Find-IT/`. Root files (`README.md`, `LICENSE`, `Find-IT-local-app.zip`) are still unchanged.
 
@@ -98,7 +332,7 @@ Added:
 
 Not touched: listings, claims, comments, messaging and chat, notifications, reports, timers, and their templates.
 
-## 4. Database fields and migrations
+### 4. Database fields and migrations
 
 Migration **`0003_profile_contact_photo`**, table `core_profile`:
 
@@ -111,7 +345,7 @@ Migration **`0003_profile_contact_photo`**, table `core_profile`:
 - Email, first name, last name, registration date (`date_joined`), and status (`is_active`) already exist on Django's built-in user table, so no new columns were needed for them.
 - The migration uses only standard Django fields and works on SQLite now and on PostgreSQL later.
 
-## 5. Set up and run on Windows PowerShell
+### 5. Set up and run on Windows PowerShell
 
 You need Python 3.12 or later and Git.
 
@@ -151,7 +385,7 @@ To run the automated tests:
 python manage.py test core
 ```
 
-## 6. See the feature working
+### 6. See the feature working
 
 These are the public fictional demo logins from the original README.
 
@@ -175,7 +409,7 @@ These are the public fictional demo logins from the original README.
    - Click **Activate** to restore it.
    - Use the **All roles** filter on the accounts table.
 
-## 7. Unfinished items and setup notes
+### 7. Unfinished items and setup notes
 
 - **The email rule is enforced by the forms, not the database.** Signup, profile edit, and staff creation all refuse duplicate emails. Django's built-in user table doesn't make email unique, though, and changing that would need a custom user model and a risky migration. Accounts created another way, such as **Django admin** or `createsuperuser`, could still share an email.
 - **Existing demo accounts keep their old names.** If you already had a local database, `seed_demo` won't change existing accounts. Alex's name stays as first name "Alex Finder" with no last name, and there is no email. Fix it on **Edit profile**, or delete your local `db.sqlite3` and run the setup steps again.
@@ -190,7 +424,7 @@ These are the public fictional demo logins from the original README.
 
 ## Earlier handoff — Item category and location filter (commit c54da44)
 
-### 1. Feature completed
+#### 1. Feature completed
 
 Every lost or found post now has:
 
@@ -207,13 +441,13 @@ Where the feature shows up:
 
 Posts that existed before this change automatically get the category **Other** and a blank location, so no data is lost.
 
-### 2. Starting version
+#### 2. Starting version
 
 - Repository: `jblloydg/1`, branch `main`
 - Starting commit: **`9f0b2ad`**, "Initial commit: FindIT campus lost and found system"
 - Source: the app inside `Find-IT-local-app.zip` from that commit
 
-### 3. Files changed
+#### 3. Files changed
 
 The original files at the repository root (`README.md`, `LICENSE`, `Find-IT-local-app.zip`) are **unchanged**. The full working project, with the new feature, is now unpacked in the new **`Find-IT/`** folder. Everything in that folder is the same as the zip except the files below.
 
@@ -241,7 +475,7 @@ Added:
 | `Find-IT/core/tests.py` | 8 automated tests for this feature |
 | `HANDOFF.md` | This file |
 
-### 4. Database fields and migrations
+#### 4. Database fields and migrations
 
 Table `core_itempost`:
 
@@ -253,7 +487,7 @@ Table `core_itempost`:
 - `0001_initial.py` was not in the zip. The original README asked you to generate it with `makemigrations`. It is now included and committed, as the README recommended, so you no longer need to run `makemigrations`. If you do run it, it should say "No changes detected".
 - `0002_item_category_location.py` adds only the two columns above. It uses only standard Django fields, so it works on SQLite now and on PostgreSQL later without changes.
 
-### 5. Set up and run on Windows PowerShell
+#### 5. Set up and run on Windows PowerShell
 
 You need Python 3.12 or later and Git.
 
@@ -292,7 +526,7 @@ To run the automated tests (optional):
 python manage.py test core
 ```
 
-### 6. See the feature working
+#### 6. See the feature working
 
 1. Sign in with the fictional demo account **2026-0001** and the password **DemoFindIt!2026**. This is the public demo login from the original README.
 2. On **Browse items**, each card now has a teal category tag and a 📍 location tag. The bottle shows *Bottle or container* and *Library 2nd floor*. The umbrella shows *Umbrella* and *Canteen*.
@@ -302,7 +536,7 @@ python manage.py test core
 6. Click **＋ Create post**. Choose **Lost**, then category **Phone or electronics**, and enter a title, a description and the location `Gym`. Publish it. The detail page shows both tags.
 7. On that detail page, click the category tag. You are taken back to the browse page filtered to *Phone or electronics*.
 
-### 7. Unfinished items and setup notes
+#### 7. Unfinished items and setup notes
 
 - **The category list is fixed in code** (`ItemPost.Category` in `core/models.py`). Administrators cannot add categories from the website yet. Adding one means editing that list and creating a new migration.
 - **Location is free text**, not a list of Davao Oriental State University buildings. People may spell the same place differently, for example "Lib" and "Library". A fixed list of campus areas could be added later once the building names are confirmed.

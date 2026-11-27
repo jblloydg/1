@@ -9,7 +9,7 @@
     <div class="profile-head">
       {% include "core/includes/avatar.html" with person=profile_user size="lg" %}
       <div class="profile-head-text">
-        <h2>{{ profile_user.get_full_name|default:profile_user.username }}</h2>
+        <h2>{% firstof profile_user.get_full_name profile_user.username %}</h2>
         <div class="card-meta"><span class="subtle-chip role-{{ profile.role }}">{{ profile.get_role_display }}</span><span class="subtle-chip {% if profile_user.is_active %}account-active{% else %}account-suspended{% endif %}">{% if profile_user.is_active %}Active{% else %}Suspended{% endif %}</span></div>
       </div>
     </div>

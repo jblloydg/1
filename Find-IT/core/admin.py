@@ -6,6 +6,7 @@ from .models import (
     AbuseReport, ClaimAnswer, ClaimApplication, ChatMessage, Comment, Conversation,
     InAppNotification, ItemPost, PostStatusEvent, Profile, StaffAuditLog,
     SystemSettings, VerificationQuestion,
+    GeneralReport, ModeratorVerification, ModeratorVerificationEvent, ReportStatusEvent,
 )
 
 User = get_user_model()
@@ -67,7 +68,7 @@ class ClaimApplicationAdmin(admin.ModelAdmin):
 
 @admin.register(AbuseReport)
 class AbuseReportAdmin(admin.ModelAdmin):
-    list_display = ("reason", "status", "reporter", "target_user", "created_at")
+    list_display = ("reference", "reason", "status", "reporter", "target_user", "assigned_reviewer", "created_at")
     list_filter = ("status", "reason")
     readonly_fields = ("reporter", "conversation", "target_user", "details", "created_at")
 
@@ -98,3 +99,41 @@ class ProtectedHistoryAdmin(admin.ModelAdmin):
 
 for model in [Comment, Conversation, ChatMessage, ClaimAnswer, PostStatusEvent, InAppNotification, StaffAuditLog]:
     admin.site.register(model, ProtectedHistoryAdmin)
+
+
+
+# Read-only views for the moderator verification and report features. Decisions are made in the
+# Find-IT pages so that history and permission checks are always applied.
+class ReadOnlyAdmin(admin.ModelAdmin):
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(GeneralReport)
+class GeneralReportAdmin(ReadOnlyAdmin):
+    list_display = ("reference", "category", "status", "reporter", "post", "assigned_reviewer", "created_at")
+    list_filter = ("status", "category")
+    search_fields = ("reference", "description", "reporter__username")
+    exclude = ("attachment",)
+
+
+@admin.register(ModeratorVerification)
+class ModeratorVerificationAdmin(ReadOnlyAdmin):
+    list_display = ("staff", "status", "reviewed_by", "decided_at")
+    list_filter = ("status",)
+
+
+@admin.register(ModeratorVerificationEvent)
+class ModeratorVerificationEventAdmin(ReadOnlyAdmin):
+    list_display = ("verification", "previous_status", "new_status", "actor", "created_at")
+
+
+@admin.register(ReportStatusEvent)
+class ReportStatusEventAdmin(ReadOnlyAdmin):
+    list_display = ("chat_report", "general_report", "previous_status", "new_status", "actor", "created_at")
