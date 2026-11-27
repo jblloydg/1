@@ -276,6 +276,21 @@ class ProfileForm(forms.Form):
         return user
 
 
+class FindItSetPasswordForm(SetPasswordForm):
+    """Used by the emailed password-reset link."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["new_password1"].label = "New password"
+        self.fields["new_password2"].label = "Confirm new password"
+        for name in ("new_password1", "new_password2"):
+            self.fields[name].widget.attrs["data-password-toggle"] = "true"
+        self.fields["new_password1"].help_text = (
+            "At least 8 characters. Avoid common passwords, passwords that are only numbers, "
+            "or anything close to your name, ID, or email."
+        )
+
+
 class FindItPasswordChangeForm(PasswordChangeForm):
     """Django's secure password change form with Find-IT labels and show/hide toggles."""
 

@@ -19,7 +19,7 @@
     <button class="button button-outline" type="submit">Search</button>
   </form>
   {% if q or selected_type or selected_status or selected_category or location %}<p class="filter-clear"><a href="{% url 'home' %}">Clear all filters</a></p>{% endif %}
-  <div class="result-heading"><h2>Recent listings</h2><span class="muted">{{ posts|length }} shown</span></div>
+  <div class="result-heading"><h2>Recent listings</h2><span class="muted">{{ page_obj.paginator.count }} found</span></div>
   <div class="post-grid">
     {% for post in posts %}
     <article class="post-card">
@@ -42,5 +42,6 @@
     </div>
     {% endfor %}
   </div>
+  {% include "core/includes/pagination.html" %}
 </section>
 {% endblock %}

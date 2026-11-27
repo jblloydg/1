@@ -85,6 +85,10 @@ class ItemPost(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["is_archived", "-created_at"], name="itempost_browse_idx"),
+            models.Index(fields=["post_type", "status"], name="itempost_type_status_idx"),
+        ]
 
     def __str__(self):
         return self.title
@@ -218,6 +222,7 @@ class ChatMessage(models.Model):
 
     class Meta:
         ordering = ["sent_at"]
+        indexes = [models.Index(fields=["conversation", "sent_at"], name="chatmessage_conv_time_idx")]
 
     def __str__(self):
         return f"Message from {self.sender}"
@@ -248,6 +253,7 @@ class InAppNotification(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [models.Index(fields=["recipient", "read_at"], name="notification_unread_idx")]
 
 
 class ReportStatus(models.TextChoices):

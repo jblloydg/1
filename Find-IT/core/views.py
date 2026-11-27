@@ -1,5 +1,7 @@
+import logging
 import os
 
+from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth import authenticate, get_user_model, login, logout, update_session_auth_hash
 from django.contrib.auth.decorators import login_required
@@ -7,13 +9,15 @@ from django.contrib.auth.forms import AuthenticationForm
 from django.db import IntegrityError, transaction
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.http import FileResponse, Http404, HttpResponseForbidden, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.decorators.cache import never_cache
+from django.views.decorators.debug import sensitive_post_parameters
 from django.views.decorators.http import require_POST
 
 from .forms import (
@@ -22,10 +26,11 @@ from .forms import (
     SystemSettingsForm,
 )
 from .models import (
-    OPEN_REPORT_STATUSES, AbuseReport, ClaimAnswer, ClaimApplication, Comment, Conversation, GeneralReport,
+    OPEN_REPORT_STATUSES, AbuseReport, ChatMessage, ClaimAnswer, ClaimApplication, Comment, Conversation, GeneralReport,
     InAppNotification, ItemPost, ModeratorVerification, ModeratorVerificationEvent, ReportStatus, PostStatusEvent, Profile, StaffAuditLog,
     SystemSettings, VerificationQuestion,
 )
+from .security import clear_login_failures, client_ip, login_is_locked, record_login_failure
 from .permissions import (
     can_review_private_chats, can_review_reports, is_admin, is_staff_or_admin, role_of,
 )
@@ -58,16 +63,31 @@ def _role_home(user):
     return "staff-dashboard" if is_staff_or_admin(user) else "home"
 
 
+@sensitive_post_parameters("password")
+@never_cache
 def login_view(request):
     if request.user.is_authenticated:
         return redirect(_safe_next(request, fallback=_role_home(request.user)))
     form = FindItLoginForm(request, data=request.POST or None)
     if request.method == "POST":
+        username = request.POST.get("username", "")
+        ip = client_ip(request)
+        if login_is_locked(username, ip):
+            minutes = max(1, settings.LOGIN_LOCKOUT_SECONDS // 60)
+            form = FindItLoginForm(request)
+            form.initial["username"] = username.strip()[:150]
+            messages.error(
+                request,
+                f"Too many failed sign-in attempts. Wait {minutes} minutes and try again, or reset your password.",
+            )
+            return render(request, "core/login.html", {"form": form, "next": request.POST.get("next", "")}, status=429)
         if form.is_valid():
             user = form.get_user()
+            clear_login_failures(username, ip)
             login(request, user)  # Rotates the session key to prevent session fixation.
             messages.success(request, f"Welcome back, {user.first_name or user.username}.")
             return redirect(_safe_next(request, fallback=_role_home(user)))
+        record_login_failure(username, ip)
         messages.error(request, "Sign-in failed. Check the details below.")
     return render(request, "core/login.html", {
         "form": form,
@@ -75,6 +95,7 @@ def login_view(request):
     })
 
 
+@sensitive_post_parameters("password1", "password2")
 def signup_view(request):
     if request.user.is_authenticated:
         return redirect("home")
@@ -89,6 +110,7 @@ def signup_view(request):
     return render(request, "core/signup.html", {"form": form})
 
 
+@never_cache
 @login_required
 def my_profile(request):
     user = User.objects.select_related("profile").get(pk=request.user.pk)
@@ -113,6 +135,8 @@ def edit_profile(request):
     return render(request, "core/profile_edit.html", {"form": form, "profile": user.profile})
 
 
+@sensitive_post_parameters("old_password", "new_password1", "new_password2")
+@never_cache
 @login_required
 def change_password(request):
     form = FindItPasswordChangeForm(request.user, request.POST if request.method == "POST" else None)
@@ -154,8 +178,11 @@ def home(request):
         category = ""
     if location:
         posts = posts.filter(location__icontains=location)
+    page_obj = _paginate(request, posts, 24)
     return render(request, "core/home.html", {
-        "posts": posts[:100],
+        "posts": page_obj,
+        "page_obj": page_obj,
+        "querystring": _querystring_without_page(request),
         "q": q,
         "selected_type": post_type,
         "selected_status": status,
@@ -359,28 +386,40 @@ def add_comment(request, post_id):
 
 @login_required
 def my_posts(request):
-    posts = ItemPost.objects.filter(author=request.user).order_by("-created_at")
+    posts = ItemPost.objects.filter(author=request.user).annotate(claim_count=Count("claims")).order_by("-created_at")
     return render(request, "core/my_posts.html", {"posts": posts})
 
 
+@never_cache
 @login_required
 def my_claims(request):
-    claims = ClaimApplication.objects.filter(claimant=request.user).select_related("post", "post__author")
+    claims = ClaimApplication.objects.filter(claimant=request.user).select_related("post", "post__author", "conversation")
     return render(request, "core/my_claims.html", {"claims": claims})
 
 
+@never_cache
 @login_required
 def claim_review(request, claim_id):
+    """Private ownership answers.
+
+    Visible to: the claimant (their own answers, read-only), the finder who wrote the
+    questions, and Staff/Admin accounts handling claims. Everyone else gets 403.
+    """
     claim = get_object_or_404(
-        ClaimApplication.objects.select_related("post", "claimant"),
+        ClaimApplication.objects.select_related("post", "post__author", "claimant"),
         pk=claim_id,
     )
-    if claim.post.author_id != request.user.pk and not is_staff_or_admin(request.user):
-        return HttpResponseForbidden("Only the finder or authorized staff may review this private form.")
-    if is_staff_or_admin(request.user) and claim.post.author_id != request.user.pk:
+    is_claimant = claim.claimant_id == request.user.pk
+    is_finder = claim.post.author_id == request.user.pk
+    staff_access = is_staff_or_admin(request.user)
+    if not (is_claimant or is_finder or staff_access):
+        return HttpResponseForbidden("Only the claimant, the finder, or authorized staff may view this private form.")
+    if staff_access and not (is_claimant or is_finder):
         audit(request.user, "viewed_claim_form", claim, "Staff opened private ownership answers.")
     answers = claim.answers.select_related("question").order_by("question__order")
-    return render(request, "core/claim_review.html", {"claim": claim, "answers": answers})
+    return render(request, "core/claim_review.html", {
+        "claim": claim, "answers": answers, "viewer_is_claimant": is_claimant,
+    })
 
 
 @login_required
@@ -480,6 +519,7 @@ def remove_post_view(request, post_id):
     return redirect("my-posts" if request.user.pk == post.author_id else "staff-dashboard")
 
 
+@never_cache
 @login_required
 def chat_room(request, conversation_id):
     conversation = get_object_or_404(
@@ -584,9 +624,16 @@ def notifications(request):
 
 @login_required
 def messages_inbox(request):
+    # Only the newest message per conversation is loaded (sliced prefetch), not every message.
     conversations = Conversation.objects.filter(
         Q(initiator=request.user) | Q(recipient=request.user)
-    ).select_related("post", "initiator", "recipient").prefetch_related("messages")
+    ).select_related("post", "initiator", "recipient").prefetch_related(
+        Prefetch(
+            "messages",
+            queryset=ChatMessage.objects.select_related("sender").order_by("-sent_at")[:1],
+            to_attr="latest_messages",
+        )
+    )
     return render(request, "core/messages.html", {"conversations": conversations[:100]})
 
 
@@ -594,13 +641,13 @@ def messages_inbox(request):
 def staff_dashboard(request):
     if not is_staff_or_admin(request.user):
         return HttpResponseForbidden("Staff access is required.")
-    posts = ItemPost.objects.filter(is_archived=False).select_related("author").prefetch_related("claims")
+    posts = ItemPost.objects.filter(is_archived=False).select_related("author").annotate(claim_count=Count("claims"))
     conversations = Conversation.objects.select_related("post", "initiator", "recipient")[:100]
     reviewer = can_review_reports(request.user)
     return render(request, "core/staff_dashboard.html", {
         "posts": posts[:100],
         "conversations": conversations if reviewer else [],
-        "recent_reports": AbuseReport.objects.filter(status__in=OPEN_REPORT_STATUSES)[:20] if reviewer else [],
+        "recent_reports": AbuseReport.objects.filter(status__in=OPEN_REPORT_STATUSES).select_related("reporter")[:20] if reviewer else [],
         "open_general_count": GeneralReport.objects.filter(status__in=OPEN_REPORT_STATUSES).count() if reviewer else 0,
         "is_admin": is_admin(request.user),
         "is_reviewer": reviewer,
@@ -618,6 +665,7 @@ def _querystring_without_page(request):
     return params.urlencode()
 
 
+@sensitive_post_parameters("password", "password_confirm")
 @login_required
 def staff_accounts(request):
     """Administrator account management: create staff, search, filter, and open any account."""
@@ -704,6 +752,7 @@ def staff_account_status(request, user_id):
     return redirect(_safe_next(request, fallback="staff-accounts"))
 
 
+@never_cache
 @login_required
 def edit_account(request, user_id):
     """Administrator edit of any account. Superusers and the admin's own role/status are locked."""
@@ -768,6 +817,21 @@ def admin_dashboard(request):
         "open_general_reports": GeneralReport.objects.filter(status__in=OPEN_REPORT_STATUSES).select_related("reporter", "post")[:5],
         "report_status_choices": ReportStatus.choices,
     })
+
+
+@never_cache
+@login_required
+def backup_status(request):
+    """Read-only backup information for administrators. Backups cannot be downloaded or
+    restored from the website; restore is a command-line procedure (docs/OPERATIONS.md)."""
+    if not is_admin(request.user):
+        return HttpResponseForbidden("Administrator access is required.")
+    from .backup import BackupError, status_summary
+    try:
+        info = status_summary()
+    except (BackupError, OSError) as exc:
+        info = {"error": str(exc)}
+    return render(request, "core/backup_status.html", {"info": info})
 
 
 @login_required
@@ -899,6 +963,7 @@ def admin_reports(request):
     ))
 
 
+@never_cache
 @login_required
 def review_report(request, report_id):
     """Chat safety report detail and review form."""
@@ -994,6 +1059,7 @@ def general_reports(request):
     ))
 
 
+@never_cache
 @login_required
 def general_report_detail(request, report_id):
     if not can_review_reports(request.user):
@@ -1013,6 +1079,7 @@ def general_report_detail(request, report_id):
     })
 
 
+@never_cache
 @login_required
 def general_report_attachment(request, report_id):
     """Serve a report attachment only to its reporter and authorized reviewers."""
@@ -1034,6 +1101,7 @@ def general_report_attachment(request, report_id):
     return response
 
 
+@never_cache
 @login_required
 def my_reports(request):
     """A user's own submitted reports. Internal remarks are never shown here."""
@@ -1057,3 +1125,26 @@ def staff_moderate_comment(request, comment_id):
     audit(request.user, f"comment_{action.lower()}", comment, "Comment moderation action.")
     messages.success(request, "Comment moderation updated.")
     return redirect("post-detail", post_id=comment.post_id)
+
+
+def csrf_failure(request, reason=""):
+    """Friendly page for expired or missing CSRF tokens (settings.CSRF_FAILURE_VIEW)."""
+    return render(request, "core/csrf_failure.html", status=403)
+
+
+@never_cache
+@transaction.non_atomic_requests  # must answer even when a transaction cannot be opened
+def health(request):
+    """Uptime check for monitoring services. Reports only ok/error, never details."""
+    from django.db import connection
+
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        database = "ok"
+    except Exception:  # noqa: BLE001 - any failure means "not healthy"
+        logging.getLogger("findit.errors").exception("Health check database failure")
+        database = "error"
+    healthy = database == "ok"
+    return JsonResponse({"status": "ok" if healthy else "error", "database": database}, status=200 if healthy else 503)

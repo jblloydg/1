@@ -976,3 +976,565 @@ class ExistingFeatureSmokeTests(ModerationTestBase):
         self.client.force_login(self.other_student)
         response = self.client.get(reverse("post-detail", args=[self.post.pk]))
         self.assertContains(response, f"{reverse('general-report-create')}?post={self.post.pk}")
+
+
+# ---------------------------------------------------------------------------
+# Security, claim privacy, backups, and reliability
+# ---------------------------------------------------------------------------
+import re as _re
+import uuid
+from datetime import timedelta
+import sqlite3 as _sqlite3
+from pathlib import Path as _Path
+from unittest import mock
+
+from django.contrib.auth.hashers import identify_hasher
+from django.core import mail
+from django.core.cache import cache
+from django.core.management import call_command
+from django.core.management.base import CommandError
+from django.db import OperationalError
+from django.test import Client, RequestFactory
+
+from core import backup as backup_module
+from .models import ClaimAnswer, ClaimApplication, Comment, InAppNotification, StaffAuditLog, VerificationQuestion
+
+
+class SecurityReportTests(ModerationTestBase):
+    """Section A of the testing report: password and role security."""
+
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+
+    # -- password hashing ---------------------------------------------------
+    def test_passwords_are_hashed_never_plain_text(self):
+        self.client.post(reverse("signup"), self.signup_data())
+        for user in [User.objects.get(username="2026-2001"), self.student, self.admin]:
+            self.assertNotEqual(user.password, TEST_PASSWORD)
+            self.assertNotIn(TEST_PASSWORD, user.password)
+            self.assertEqual(identify_hasher(user.password).algorithm, "pbkdf2_sha256")
+            self.assertTrue(user.check_password(TEST_PASSWORD))
+
+    def test_passwords_not_echoed_in_responses(self):
+        secret = "Wrong-But-Secret-Value-77"
+        response = self.client.post(reverse("login"), {"username": "2026-1001", "password": secret})
+        self.assertNotContains(response, secret)
+        response = self.client.post(reverse("signup"), self.signup_data(password1=secret, password2=secret + "x"))
+        self.assertNotContains(response, secret)
+        self.client.force_login(self.student)
+        response = self.client.post(reverse("change-password"), {"old_password": secret, "new_password1": secret, "new_password2": secret})
+        self.assertNotContains(response, secret)
+
+    def test_password_fields_marked_sensitive_for_error_reports(self):
+        factory = RequestFactory()
+        for view_name, url, fields in [
+            ("login_view", "/login/", ("password",)),
+            ("signup_view", "/signup/", ("password1", "password2")),
+        ]:
+            request = factory.post(url, {"username": "x"})
+            request.user = mock.Mock(is_authenticated=False)
+            request.session = self.client.session
+            request._messages = mock.MagicMock()
+            from core import views as core_views
+            try:
+                getattr(core_views, view_name)(request)
+            except Exception:
+                pass
+            self.assertEqual(tuple(request.sensitive_post_parameters), fields, view_name)
+
+    # -- the six required scenarios ------------------------------------------
+    ADMIN_URLS = ["admin-dashboard", "staff-accounts", "moderator-verifications", "admin-settings", "backup-status"]
+
+    def test_1_student_cannot_open_admin_urls(self):
+        self.client.force_login(self.student)
+        for name in self.ADMIN_URLS:
+            response = self.client.get(reverse(name))
+            self.assertEqual(response.status_code, 403, name)
+            self.assertContains(response, "You don't have access", status_code=403)
+        self.assertEqual(self.client.get(reverse("edit-account", args=[self.staff.pk])).status_code, 403)
+        self.assertEqual(self.client.get("/django-admin/").status_code, 302)
+
+    def test_2_student_cannot_use_staff_functions(self):
+        self.client.force_login(self.other_student)
+        comment = Comment.objects.create(post=self.post, author=self.student, text="Hello")
+        checks = [
+            self.client.get(reverse("staff-dashboard")),
+            self.client.post(reverse("moderate-comment", args=[comment.pk]), {"action": "REMOVED"}),
+            self.client.post(reverse("turnover", args=[self.post.pk])),
+            self.client.post(reverse("close-post", args=[self.post.pk])),
+            self.client.post(reverse("pause-chat", args=[self.conversation.pk])),
+        ]
+        for response in checks:
+            self.assertEqual(response.status_code, 403)
+        comment.refresh_from_db()
+        self.assertEqual(comment.moderation_status, Comment.Moderation.VISIBLE)
+        self.post.refresh_from_db()
+        self.assertEqual(self.post.status, ItemPost.Status.OPEN)
+
+    def test_3_staff_cannot_use_admin_functions(self):
+        self.client.force_login(self.moderator)  # even a verified moderator
+        for name in self.ADMIN_URLS:
+            self.assertEqual(self.client.get(reverse(name)).status_code, 403, name)
+        posts = [
+            (reverse("staff-account-status", args=[self.student.pk]), {"action": "suspend"}),
+            (reverse("edit-account", args=[self.student.pk]), {"first_name": "X", "role": "admin", "is_active": "1"}),
+            (reverse("moderator-verification-action", args=[self.staff.pk]), {"action": "request"}),
+            (reverse("staff-accounts"), {"first_name": "X", "username": "new.staff", "password": TEST_PASSWORD, "password_confirm": TEST_PASSWORD}),
+        ]
+        for url, data in posts:
+            self.assertEqual(self.client.post(url, data).status_code, 403, url)
+        self.student.refresh_from_db()
+        self.assertTrue(self.student.is_active)
+        self.assertEqual(self.student.profile.role, Profile.Role.STUDENT)
+        self.assertFalse(User.objects.filter(username="new.staff").exists())
+
+    def test_4_user_cannot_modify_another_users_account_or_password(self):
+        self.client.force_login(self.other_student)
+        self.assertEqual(self.client.post(reverse("edit-account", args=[self.student.pk]), {"first_name": "Hacked"}).status_code, 403)
+        # Profile and password forms only ever act on the signed-in user, whatever is posted.
+        self.client.post(reverse("edit-profile"), {"first_name": "Self", "email": "student2@example.com", "user_id": self.student.pk})
+        self.client.post(reverse("change-password"), {
+            "old_password": TEST_PASSWORD, "new_password1": "Brand-New-Pass-55", "new_password2": "Brand-New-Pass-55",
+            "user_id": self.student.pk, "username": self.student.username,
+        })
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.first_name, "Sam")
+        self.assertTrue(self.student.check_password(TEST_PASSWORD))
+        self.other_student.refresh_from_db()
+        self.assertTrue(self.other_student.check_password("Brand-New-Pass-55"))
+
+    def test_5_user_cannot_change_own_role(self):
+        for user in [self.student, self.staff, self.moderator]:
+            self.client.force_login(user)
+            self.client.post(reverse("edit-profile"), {"first_name": "Me", "email": user.email or f"{user.username}@example.com", "role": "admin", "is_superuser": "1", "is_staff": "1"})
+            self.client.post(reverse("edit-account", args=[user.pk]), {"first_name": "Me", "role": "admin", "is_active": "1"})
+            user.refresh_from_db()
+            self.assertNotEqual(user.profile.role, Profile.Role.ADMIN)
+            self.assertFalse(user.is_superuser or user.is_staff)
+        self.client.force_login(self.admin)
+        self.client.post(reverse("edit-account", args=[self.admin.pk]), {"first_name": "Ada", "role": "student", "is_active": "0"})
+        self.admin.refresh_from_db()
+        self.assertTrue(self.admin.is_active)
+
+    def test_6_unauthenticated_visitor_redirected(self):
+        claim = ClaimApplication.objects.create(post=self.post, claimant=self.other_student)
+        get_urls = [
+            reverse("home"), reverse("my-profile"), reverse("edit-profile"), reverse("change-password"),
+            reverse("my-posts"), reverse("my-claims"), reverse("messages"), reverse("notifications"),
+            reverse("my-reports"), reverse("create-post"), reverse("claim-review", args=[claim.pk]),
+            reverse("chat-room", args=[self.conversation.pk]), reverse("staff-dashboard"), reverse("admin-dashboard"),
+            reverse("staff-accounts"), reverse("backup-status"), reverse("admin-reports"), reverse("general-reports"),
+        ]
+        for url in get_urls:
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 302, url)
+            self.assertTrue(response["Location"].startswith(reverse("login")), url)
+        for url in [reverse("staff-account-status", args=[self.student.pk]), reverse("submit-claim", args=[self.post.pk])]:
+            response = self.client.post(url, {"action": "suspend"})
+            self.assertEqual(response.status_code, 302, url)
+        self.student.refresh_from_db()
+        self.assertTrue(self.student.is_active)
+
+    # -- login throttling ---------------------------------------------------
+    @override_settings(LOGIN_FAILURE_LIMIT=3, LOGIN_LOCKOUT_SECONDS=900)
+    def test_login_locked_after_repeated_failures(self):
+        for _ in range(3):
+            self.client.post(reverse("login"), {"username": "2026-1001", "password": "wrong-pass"})
+        response = self.client.post(reverse("login"), {"username": "2026-1001", "password": TEST_PASSWORD})
+        self.assertEqual(response.status_code, 429)
+        self.assertContains(response, "Too many failed sign-in attempts", status_code=429)
+        self.assertNotIn(SESSION_KEY, self.client.session)
+        # A different computer (IP address) is not blocked by someone else's failures.
+        other = Client(REMOTE_ADDR="10.0.0.9")
+        self.assertEqual(other.post(reverse("login"), {"username": "2026-1001", "password": TEST_PASSWORD}).status_code, 302)
+        cache.clear()  # the lockout window passing
+        self.assertEqual(self.client.post(reverse("login"), {"username": "2026-1001", "password": TEST_PASSWORD}).status_code, 302)
+
+    @override_settings(LOGIN_FAILURE_LIMIT=3)
+    def test_successful_login_resets_failure_count(self):
+        for _ in range(2):
+            self.client.post(reverse("login"), {"username": "2026-1001", "password": "wrong-pass"})
+        self.client.post(reverse("login"), {"username": "2026-1001", "password": TEST_PASSWORD})
+        self.client.logout()
+        for _ in range(2):
+            self.client.post(reverse("login"), {"username": "2026-1001", "password": "wrong-pass"})
+        self.assertEqual(self.client.post(reverse("login"), {"username": "2026-1001", "password": TEST_PASSWORD}).status_code, 302)
+
+    # -- password reset -----------------------------------------------------
+    def test_password_reset_flow(self):
+        response = self.client.post(reverse("password_reset"), {"email": "STUDENT1@example.com"})
+        self.assertRedirects(response, reverse("password_reset_done"))
+        self.assertEqual(len(mail.outbox), 1)
+        body = mail.outbox[0].body
+        self.assertNotIn(TEST_PASSWORD, body)
+        link = _re.search(r"https?://[^/]+(/password-reset/[^/\s]+/[^/\s]+/)", body).group(1)
+        response = self.client.get(link, follow=True)
+        self.assertContains(response, "Choose a new password")
+        set_url = response.redirect_chain[-1][0]
+        new = "Recovered-Pass-2026"
+        response = self.client.post(set_url, {"new_password1": new, "new_password2": new})
+        self.assertRedirects(response, reverse("password_reset_complete"))
+        self.student.refresh_from_db()
+        self.assertTrue(self.student.check_password(new))
+        # The link only works once.
+        self.assertContains(self.client.get(link, follow=True), "This link no longer works")
+
+    def test_password_reset_does_not_reveal_accounts(self):
+        unknown = self.client.post(reverse("password_reset"), {"email": "nobody@example.com"})
+        self.assertRedirects(unknown, reverse("password_reset_done"))
+        self.student.is_active = False
+        self.student.save()
+        self.client.post(reverse("password_reset"), {"email": "student1@example.com"})
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_reset_link_for_one_user_cannot_change_another(self):
+        self.client.post(reverse("password_reset"), {"email": "student1@example.com"})
+        link = _re.search(r"(/password-reset/[^/\s]+/[^/\s]+/)", mail.outbox[0].body).group(1)
+        uid, token = link.strip("/").split("/")[1:3]
+        from django.utils.http import urlsafe_base64_encode
+        from django.utils.encoding import force_bytes
+        forged = f"/password-reset/{urlsafe_base64_encode(force_bytes(self.other_student.pk))}/{token}/"
+        self.assertContains(self.client.get(forged, follow=True), "This link no longer works")
+
+
+class ClaimPrivacyTests(ModerationTestBase):
+    """Section B of the testing report: private claim answers."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        cls.found = ItemPost.objects.create(
+            author=cls.student, post_type=ItemPost.Type.FOUND, title="Silver watch", description="Found near the gym.",
+        )
+        for order in range(1, 6):
+            VerificationQuestion.objects.create(post=cls.found, order=order, text=f"Private question {order}?")
+        cls.claim = ClaimApplication.objects.create(post=cls.found, claimant=cls.other_student)
+        for question in cls.found.verification_questions.all():
+            ClaimAnswer.objects.create(claim=cls.claim, question=question, answer_text=f"SECRET-ANSWER-{question.order}")
+        cls.third = make_user("2026-1009", email="third@example.com", first_name="Tess")
+
+    def url(self):
+        return reverse("claim-review", args=[self.claim.pk])
+
+    def test_1_claimant_views_own_answers(self):
+        self.client.force_login(self.other_student)
+        response = self.client.get(self.url())
+        self.assertContains(response, "SECRET-ANSWER-1")
+        self.assertContains(response, "These are the answers you submitted")
+        self.assertIn("no-store", response["Cache-Control"])
+        self.assertContains(self.client.get(reverse("my-claims")), self.url())
+
+    def test_2_other_student_cannot_view_answers(self):
+        self.client.force_login(self.third)
+        response = self.client.get(self.url())
+        self.assertEqual(response.status_code, 403)
+        self.assertNotContains(response, "SECRET-ANSWER", status_code=403)
+        for url in [reverse("post-detail", args=[self.found.pk]), reverse("home"), reverse("my-claims"), reverse("notifications")]:
+            self.assertNotContains(self.client.get(url), "SECRET-ANSWER")
+
+    def test_3_unauthorized_direct_urls_and_parameters(self):
+        self.assertEqual(self.client.get(self.url()).status_code, 302)  # anonymous
+        self.assertNotContains(self.client.get(reverse("post-detail", args=[self.found.pk])), "SECRET-ANSWER")
+        self.client.force_login(self.third)
+        self.assertEqual(self.client.get(reverse("claim-review", args=[uuid.uuid4()])).status_code, 404)
+        self.assertEqual(self.client.post(reverse("close-claim", args=[self.claim.pk])).status_code, 403)
+        self.claim.refresh_from_db()
+        self.assertEqual(self.claim.status, ClaimApplication.Status.SUBMITTED)
+        # Recording a return needs the finder; a claim id from another post is rejected.
+        self.assertEqual(self.client.post(reverse("returned", args=[self.found.pk]), {"claim_id": self.claim.pk}).status_code, 403)
+        self.client.force_login(self.student)
+        response = self.client.post(reverse("returned", args=[self.post.pk]), {"claim_id": self.claim.pk})
+        self.assertEqual(response.status_code, 404)
+
+    def test_4_staff_and_finder_review_with_audit(self):
+        self.client.force_login(self.student)  # the finder
+        self.assertContains(self.client.get(self.url()), "SECRET-ANSWER-5")
+        self.assertFalse(StaffAuditLog.objects.filter(action="viewed_claim_form").exists())
+        self.client.force_login(self.staff)
+        self.assertContains(self.client.get(self.url()), "SECRET-ANSWER-5")
+        self.assertTrue(StaffAuditLog.objects.filter(action="viewed_claim_form", actor=self.staff).exists())
+
+    def test_5_admin_access_is_recorded(self):
+        self.client.force_login(self.admin)
+        self.assertContains(self.client.get(self.url()), "SECRET-ANSWER-3")
+        self.assertTrue(StaffAuditLog.objects.filter(action="viewed_claim_form", actor=self.admin).exists())
+        self.assertEqual(self.client.get(f"/django-admin/core/claimanswer/").status_code in {200, 404}, True)
+
+    def test_answers_not_in_notifications_or_chat(self):
+        self.client.force_login(self.third)
+        questions = list(self.found.verification_questions.all())
+        self.client.post(reverse("submit-claim", args=[self.found.pk]), {f"answer_{q.pk}": "THIRD-PRIVATE" for q in questions})
+        self.assertTrue(ClaimAnswer.objects.filter(answer_text="THIRD-PRIVATE").exists())
+        self.assertFalse(InAppNotification.objects.filter(text__contains="THIRD-PRIVATE").exists())
+        self.assertFalse(ChatMessage.objects.filter(text__contains="THIRD-PRIVATE").exists())
+        self.assertFalse(StaffAuditLog.objects.filter(details__contains="THIRD-PRIVATE").exists())
+
+
+@override_settings(BACKUP_RETENTION_DAYS=14, BACKUP_MIN_KEEP=3)
+class BackupRestoreTests(ModerationTestBase):
+    """Section C: backups run against a real SQLite file copied from the test database."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = _Path(tempfile.mkdtemp(prefix="findit-backup-test-"))
+        self.db_file = self.tmp / "live.sqlite3"
+        from django.db import connection
+        connection.ensure_connection()
+        # Copy the test database (inside the test transaction) to a real file with SQL statements.
+        target = _sqlite3.connect(self.db_file)
+        target.executescript("\n".join(connection.connection.iterdump()))
+        target.close()
+        self.backup_dir = self.tmp / "backups"
+        self.patches = [
+            override_settings(BACKUP_DIR=self.backup_dir),
+            mock.patch.object(backup_module, "_db_settings", return_value={"ENGINE": "django.db.backends.sqlite3", "NAME": str(self.db_file)}),
+        ]
+        for p in self.patches:
+            p.enable() if hasattr(p, "enable") else p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.disable() if hasattr(p, "disable") else p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        super().tearDown()
+
+    def live_count(self, table="core_itempost"):
+        conn = _sqlite3.connect(self.db_file)
+        try:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        finally:
+            conn.close()
+
+    def make_old_backup(self, days_old, kind="daily", index=0):
+        path = backup_module.create_backup(kind)
+        stamp = (timezone.localtime() - timedelta(days=days_old)).strftime("%Y%m%d-%H%M%S")
+        new = path.with_name(f"findit-{kind}-{stamp}{'-' + str(index) if index else ''}.sqlite3")
+        path.rename(new)
+        sidecar = path.with_name(path.name + ".sha256")
+        new_sidecar = new.with_name(new.name + ".sha256")
+        sidecar.rename(new_sidecar)
+        return new
+
+    def test_1_daily_backup_generated(self):
+        call_command("backup_db", "--kind", "daily", stdout=io.StringIO())
+        files = list(self.backup_dir.glob("findit-daily-*.sqlite3"))
+        self.assertEqual(len(files), 1)
+        log = backup_module.read_log()
+        self.assertEqual(log[0]["status"], "success")
+        self.assertEqual(log[0]["file"], files[0].name)
+
+    def test_2_backup_is_valid_and_complete(self):
+        path = backup_module.create_backup("manual")
+        self.assertEqual(backup_module.validate_backup_file(path, "sqlite"), "sqlite")
+        self.assertTrue(backup_module.checksum_matches(path))
+        conn = _sqlite3.connect(path)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM auth_user").fetchone()[0], User.objects.count())
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM core_itempost").fetchone()[0], ItemPost.objects.count())
+        conn.close()
+
+    def test_3_filename_contains_date_and_never_overwrites(self):
+        first = backup_module.create_backup("daily")
+        self.assertRegex(first.name, rf"^findit-daily-{timezone.localtime():%Y%m%d}-\d{{6}}(-\d+)?\.sqlite3$")
+        with mock.patch.object(backup_module.timezone, "localtime", return_value=timezone.localtime()):
+            a = backup_module.create_backup("daily")
+            b = backup_module.create_backup("daily")
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.exists() and b.exists() and first.exists())
+
+    def test_4_retention_policy(self):
+        old = [self.make_old_backup(days, index=i) for i, days in enumerate([40, 35, 30, 25, 20], start=1)]
+        recent = backup_module.create_backup("daily")
+        deleted = backup_module.apply_retention(retention_days=14, min_keep=3)
+        remaining = {f.name for f in backup_module.list_backups()}
+        # Newest 3 kept (recent + 20 and 25 days old); older-than-14-days beyond that removed.
+        self.assertEqual(set(deleted), {old[0].name, old[1].name, old[2].name})
+        self.assertEqual(remaining, {recent.name, old[3].name, old[4].name})
+        self.assertFalse(old[0].with_name(old[0].name + ".sha256").exists())
+
+    def test_4b_retention_never_deletes_only_backup_or_damaged_files(self):
+        only = self.make_old_backup(100)
+        self.assertEqual(backup_module.apply_retention(retention_days=1, min_keep=1), [])
+        self.assertTrue(only.exists())
+        damaged = self.make_old_backup(90, index=7)
+        damaged.write_bytes(damaged.read_bytes()[:-10] + b"0123456789")
+        newer = backup_module.create_backup("daily")
+        deleted = backup_module.apply_retention(retention_days=1, min_keep=1)
+        self.assertIn(only.name, deleted)
+        self.assertTrue(damaged.exists(), "Damaged backups are kept for inspection.")
+        self.assertTrue(newer.exists())
+
+    def test_5_restore_valid_backup(self):
+        path = backup_module.create_backup("manual")
+        before = self.live_count()
+        conn = _sqlite3.connect(self.db_file)
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DELETE FROM core_itempost")
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.live_count(), 0)
+        out = io.StringIO()
+        call_command("restore_db", path.name, "--yes", stdout=out)
+        self.assertEqual(self.live_count(), before)
+        self.assertIn("Restore complete", out.getvalue())
+        pre = [f for f in backup_module.list_backups() if f.kind == "pre-restore"]
+        self.assertEqual(len(pre), 1)
+        conn = _sqlite3.connect(pre[0].path)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM core_itempost").fetchone()[0], 0)  # the state before restore
+        conn.close()
+        self.assertEqual(backup_module.read_log()[0]["action"], "restore")
+
+    def test_6_invalid_or_corrupted_backups_refused(self):
+        good = backup_module.create_backup("manual")
+        before = self.live_count()
+        cases = {}
+        junk = self.backup_dir / "findit-manual-20200101-000000.sqlite3"
+        junk.write_bytes(b"not a database at all" * 50)
+        cases["junk"] = junk
+        tampered = self.backup_dir / "findit-manual-20200102-000000.sqlite3"
+        tampered.write_bytes(good.read_bytes())
+        (self.backup_dir / (tampered.name + ".sha256")).write_text("0" * 64 + "  x\n")
+        cases["checksum"] = tampered
+        empty_db = self.backup_dir / "findit-manual-20200103-000000.sqlite3"
+        _sqlite3.connect(empty_db).execute("CREATE TABLE other (id int)").connection.commit()
+        cases["not findit"] = empty_db
+        wrong_engine = self.backup_dir / "findit-manual-20200104-000000.dump"
+        wrong_engine.write_bytes(b"PGDMP")
+        cases["wrong engine"] = wrong_engine
+        cases["missing"] = self.backup_dir / "does-not-exist.sqlite3"
+        for label, path in cases.items():
+            with self.assertRaises(CommandError, msg=label):
+                call_command("restore_db", str(path), "--yes", stdout=io.StringIO())
+        self.assertEqual(self.live_count(), before)
+        self.assertFalse(any(f.kind == "pre-restore" for f in backup_module.list_backups()))
+        failures = [e for e in backup_module.read_log() if e["action"] == "restore"]
+        self.assertTrue(all(e["status"] == "failed" for e in failures))
+        self.assertEqual(len(failures), len(cases))
+
+    def test_restore_requires_confirmation(self):
+        path = backup_module.create_backup("manual")
+        with mock.patch("sys.stdin") as stdin:
+            stdin.isatty.return_value = False
+            with self.assertRaisesMessage(CommandError, "needs confirmation"):
+                call_command("restore_db", path.name, stdout=io.StringIO())
+            stdin.isatty.return_value = True
+            with mock.patch("builtins.input", return_value="no"):
+                with self.assertRaisesMessage(CommandError, "cancelled"):
+                    call_command("restore_db", path.name, stdout=io.StringIO())
+
+    def test_failed_backup_is_logged_and_reported(self):
+        self.db_file.unlink()
+        with self.assertRaisesMessage(CommandError, "Backup FAILED"):
+            call_command("backup_db", stdout=io.StringIO())
+        entry = backup_module.read_log()[0]
+        self.assertEqual((entry["action"], entry["status"]), ("backup", "failed"))
+        self.assertFalse(list(self.backup_dir.glob("*.partial")))
+
+    def test_7_unauthorized_users_cannot_reach_backups(self):
+        backup_module.create_backup("daily")
+        for user in [self.student, self.staff, self.moderator]:
+            self.client.force_login(user)
+            self.assertEqual(self.client.get(reverse("backup-status")).status_code, 403)
+        self.client.logout()
+        self.assertEqual(self.client.get(reverse("backup-status")).status_code, 302)
+        self.client.force_login(self.admin)
+        response = self.client.get(reverse("backup-status"))
+        self.assertContains(response, "findit-daily-")
+        self.assertIn("no-store", response["Cache-Control"])
+        name = backup_module.list_backups()[0].name
+        for url in [f"/backups/{name}", f"/media/{name}", f"/static/{name}", f"/media/../backups/{name}"]:
+            self.assertEqual(self.client.get(url).status_code, 404, url)
+        from django.conf import settings as dj_settings
+        for public in [dj_settings.MEDIA_ROOT, dj_settings.STATIC_ROOT, *dj_settings.STATICFILES_DIRS]:
+            self.assertFalse(str(self.backup_dir).startswith(str(public)))
+
+
+class ReliabilityTests(ModerationTestBase):
+    """Section E: error handling, health check, and friendly failures."""
+
+    def test_health_check_ok(self):
+        response = self.client.get(reverse("health"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok", "database": "ok"})
+
+    def test_health_check_reports_database_failure_without_details(self):
+        with mock.patch("django.db.backends.base.base.BaseDatabaseWrapper.cursor", side_effect=OperationalError("secret dsn details")):
+            with self.assertLogs("findit.errors", "ERROR"):
+                response = self.client.get(reverse("health"))
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "error", "database": "error"})
+        self.assertNotIn(b"secret", response.content)
+
+    @override_settings(DEBUG=False)
+    def test_unexpected_error_shows_safe_500_and_is_logged(self):
+        client = Client(raise_request_exception=False)
+        client.force_login(self.student)
+        with mock.patch.object(GeneralReport.objects, "filter", side_effect=RuntimeError("internal secret detail")):
+            with self.assertLogs("django.request", "ERROR") as logs:
+                response = client.get(reverse("my-reports"))
+        self.assertEqual(response.status_code, 500)
+        self.assertContains(response, "Something went wrong", status_code=500)
+        self.assertNotContains(response, "internal secret detail", status_code=500)
+        self.assertNotContains(response, "Traceback", status_code=500)
+        self.assertIn("internal secret detail", "\n".join(logs.output))
+
+    def test_partial_write_is_rolled_back_on_database_error(self):
+        """The report row is saved first, then the history step fails: nothing may remain."""
+        self.client.force_login(self.student)
+        with mock.patch("core.views.record_report_submission", side_effect=OperationalError("disk I/O error")):
+            with self.assertLogs("findit.errors", "ERROR"):
+                response = self.client.post(reverse("general-report-create"), {"category": "TECHNICAL", "description": "Search results look wrong."})
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(GeneralReport.objects.filter(description="Search results look wrong.").exists())
+
+    def test_database_error_gives_clear_503_and_saves_nothing(self):
+        self.client.force_login(self.student)
+        before = GeneralReport.objects.count()
+        with mock.patch.object(GeneralReport, "save", side_effect=OperationalError("database is locked")):
+            with self.assertLogs("findit.errors", "ERROR"):
+                response = self.client.post(reverse("general-report-create"), {"category": "TECHNICAL", "description": "Upload keeps failing here."})
+        self.assertEqual(response.status_code, 503)
+        self.assertContains(response, "was <strong>not saved</strong>", status_code=503)
+        self.assertNotContains(response, "database is locked", status_code=503)
+        self.assertEqual(GeneralReport.objects.count(), before)
+
+    @override_settings(DEBUG=False)
+    def test_friendly_404_and_403_pages(self):
+        self.client.force_login(self.student)
+        response = self.client.get("/no-such-page/")
+        self.assertContains(response, "Page not found", status_code=404)
+        response = self.client.get(reverse("admin-dashboard"))
+        self.assertContains(response, "Administrator access is required.", status_code=403)
+        self.assertContains(response, "You don't have access", status_code=403)
+
+    def test_csrf_failure_is_friendly(self):
+        client = Client(enforce_csrf_checks=True)
+        response = client.post(reverse("login"), {"username": "x", "password": "y"})
+        self.assertContains(response, "This form expired", status_code=403)
+
+    def test_home_is_paginated(self):
+        for i in range(30):
+            ItemPost.objects.create(author=self.student, post_type=ItemPost.Type.LOST, title=f"Bulk {i}", description="Bulk item")
+        self.client.force_login(self.student)
+        first = self.client.get(reverse("home"))
+        self.assertEqual(len(first.context["posts"]), 24)
+        second = self.client.get(reverse("home"), {"page": 2})
+        self.assertEqual(len(second.context["posts"]), ItemPost.objects.filter(is_archived=False).count() - 24)
+        self.assertContains(first, "Page 1 of 2")
+
+    def test_query_counts_stay_flat(self):
+        """Guards against N+1 queries on the busiest pages."""
+        for i in range(15):
+            p = ItemPost.objects.create(author=self.student, post_type=ItemPost.Type.FOUND, title=f"Many {i}", description="x")
+            c = ClaimApplication.objects.create(post=p, claimant=self.other_student)
+            conv = Conversation.objects.create(post=p, claim=c, initiator=self.other_student, recipient=self.student)
+            ChatMessage.objects.create(conversation=conv, sender=self.other_student, text=f"hello {i}")
+        checks = [(self.student, "home", 8), (self.student, "my-posts", 8), (self.other_student, "my-claims", 8),
+                  (self.student, "messages", 8), (self.admin, "staff-dashboard", 14)]
+        for user, name, limit in checks:
+            self.client.force_login(user)
+            from django.db import connection
+            from django.test.utils import CaptureQueriesContext
+            with CaptureQueriesContext(connection) as ctx:
+                self.assertEqual(self.client.get(reverse(name)).status_code, 200)
+            self.assertLessEqual(len(ctx.captured_queries), limit, f"{name}: {len(ctx.captured_queries)} queries")

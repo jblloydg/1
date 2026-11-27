@@ -13,3 +13,6 @@ staticfiles/
 *.log
 Thumbs.db
 Desktop.ini
+backups/
+*.dump
+logs/

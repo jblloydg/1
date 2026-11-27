@@ -3,7 +3,7 @@
 {% block content %}
 <section class="page-wrap">
   <div class="page-heading"><div><span class="eyebrow">Administrator only</span><h1>Admin dashboard</h1><p class="muted">Live counts from the Find-IT database. Select a number to open the matching list.</p></div>
-    <div class="button-row"><a class="button button-outline" href="{% url 'staff-dashboard' %}">Staff workspace</a><a class="button button-outline" href="{% url 'admin-settings' %}">System timers</a></div></div>
+    <div class="button-row"><a class="button button-outline" href="{% url 'staff-dashboard' %}">Staff workspace</a><a class="button button-outline" href="{% url 'admin-settings' %}">System timers</a><a class="button button-outline" href="{% url 'backup-status' %}">Backups</a></div></div>
 
   <section class="panel dash-section">
     <div class="section-heading"><div><span class="eyebrow">A</span><h2>User accounts</h2></div><a class="button button-soft button-small" href="{% url 'staff-accounts' %}">Manage accounts</a></div>

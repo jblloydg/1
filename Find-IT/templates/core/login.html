@@ -14,7 +14,7 @@
       {% if form.password.errors %}<div class="field-error">{{ form.password.errors }}</div>{% endif %}
       <button class="button button-primary button-full" type="submit">Log in</button>
     </form>
-    <p class="fine-print center">New student? <a href="{% url 'signup' %}">Create a demo account</a></p>
+    <p class="fine-print center"><a href="{% url 'password_reset' %}">Forgot your password?</a> · New student? <a href="{% url 'signup' %}">Create a demo account</a></p>
   </div>
 </section>
 {% endblock %}
